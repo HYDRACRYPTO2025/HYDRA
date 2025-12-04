@@ -1,1 +1,3 @@
-# requirements for backend
+fastapi
+uvicorn
+httpx
