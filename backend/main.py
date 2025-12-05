@@ -268,3 +268,104 @@ def admin_delete_token(
     token.is_deleted = True
     db.commit()
     return {"status": "ok", "token_id": token_id}
+
+
+# ==== ЦЕНЫ / DEX: DEXSCREENER ====
+
+
+DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens"
+
+
+@app.get("/price/dex_by_address")
+def get_price_dex_by_address(address: str):
+    """
+    Публичный эндпоинт:
+    Клиент даёт address токена, сервер ходит в DexScreener
+    и возвращает сырые данные.
+
+    Позже можем сделать тут расчёт спредов и красивый ответ.
+    Сейчас главное — чтобы вся сеть шла через сервер.
+    """
+    url = f"{DEXSCREENER_TOKENS_URL}/{address}"
+
+    try:
+        r = httpx.get(url, timeout=10.0)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"dexscreener_request_error: {e}")
+
+    if r.status_code != 200:
+        raise HTTPException(
+            status_code=r.status_code,
+            detail="bad_status_from_dexscreener",
+        )
+
+    data = r.json()
+    return {
+        "status": "ok",
+        "source": "dexscreener",
+        "address": address,
+        "raw": data,
+    }
+
+
+# ==== CEX: MEXC FUTURES PRICE ====
+
+
+MEXC_FUTURES_BASE = "https://contract.mexc.com"
+
+
+@app.get("/cex/mexc_price")
+def mexc_price(
+    base: str,
+    quote: str = "USDT",
+    price_scale: Optional[int] = None,
+):
+    """
+    Публичный эндпоинт:
+    Клиент даёт base/quote (например, base=API3, quote=USDT),
+    сервер ходит в MEXC фьючерсы и возвращает bid/ask.
+
+    Это будет аналогом get_mexc_price() из core.py,
+    только выполняется на сервере.
+    """
+    symbol = f"{base.upper()}_{quote.upper()}"
+
+    try:
+        r = httpx.get(
+            f"{MEXC_FUTURES_BASE}/api/v1/contract/ticker",
+            params={"symbol": symbol},
+            timeout=10.0,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"mexc_request_error: {e}")
+
+    try:
+        j = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"bad_json_from_mexc: {e}")
+
+    if not (j.get("success") and j.get("code") == 0 and j.get("data")):
+        raise HTTPException(
+            status_code=502,
+            detail=f"mexc_error_response: {j}",
+        )
+
+    data = j["data"]
+    bid = data.get("bid1")
+    ask = data.get("ask1")
+
+    bid_val = float(bid) if bid is not None else None
+    ask_val = float(ask) if ask is not None else None
+
+    if isinstance(price_scale, int) and price_scale >= 0:
+        if bid_val is not None:
+            bid_val = round(bid_val, price_scale)
+        if ask_val is not None:
+            ask_val = round(ask_val, price_scale)
+
+    return {
+        "symbol": symbol,
+        "bid": bid_val,
+        "ask": ask_val,
+        "price_scale": price_scale,
+    }
