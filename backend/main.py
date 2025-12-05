@@ -109,6 +109,72 @@ def db_ping():
         raise HTTPException(status_code=500, detail=f"db_error: {e}")
 
 
+# ==== ПУБЛИЧНАЯ ЧАСТЬ ДЛЯ КЛИЕНТОВ ====
+
+
+@app.post(
+    "/tokens",
+    response_model=TokenOut,
+)
+def client_add_token(
+    token: TokenCreate,
+    db: Session = Depends(get_db),
+):
+    """
+    Клиент добавляет токен.
+
+    Логика:
+    - если такой chain+address уже есть и is_deleted=False → возвращаем его;
+    - если есть и is_deleted=True → считаем, что админ забанил токен → 403;
+    - если нет → создаём новую запись.
+    """
+    existing = (
+        db.query(models.Token)
+        .filter(
+            models.Token.chain == token.chain,
+            models.Token.address == token.address,
+        )
+        .first()
+    )
+
+    if existing:
+        if existing.is_deleted:
+            raise HTTPException(status_code=403, detail="token_disabled_by_admin")
+        return existing
+
+    new_token = models.Token(
+        chain=token.chain,
+        address=token.address,
+        symbol=token.symbol,
+        name=token.name,
+    )
+    db.add(new_token)
+    db.commit()
+    db.refresh(new_token)
+    return new_token
+
+
+@app.get(
+    "/tokens",
+    response_model=List[TokenOut],
+)
+def client_list_tokens(
+    chain: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Список активных токенов для клиентов (только is_deleted=False).
+
+    Можно фильтровать по chain, чтобы, например, получить только BSC.
+    """
+    q = db.query(models.Token).filter(models.Token.is_deleted == False)  # noqa: E712
+    if chain:
+        q = q.filter(models.Token.chain == chain)
+
+    tokens = q.order_by(models.Token.created_at.desc()).all()
+    return tokens
+
+
 # ==== АДМИНКА: РАБОТА С ТОКЕНАМИ ====
 
 
@@ -125,7 +191,7 @@ def admin_add_token(
     Админ добавляет токен в БД.
 
     Если такой chain+address уже есть:
-      - если он был помечен is_deleted=True, снимаем флаг и возвращаем;
+      - если он был помечен is_deleted=True, снимаем флаг и обновляем поля;
       - если активен — просто возвращаем существующую запись.
     """
     existing = (
