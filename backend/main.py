@@ -44,6 +44,3 @@ def db_ping():
         return {"status": "ok", "db": "connected"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"db_error: {e}")
-
-
-# дальше будем добавлять эндпоинты для токенов и админ-панели
