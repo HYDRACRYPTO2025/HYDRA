@@ -12,7 +12,7 @@ def read_root():
 @app.get("/cg_ping")
 def coingecko_ping():
     """
-    Простой тест: сервер на Render делает запрос к CoinGecko
+    Тест: сервер на Render делает запрос к CoinGecko
     и возвращает их ответ.
     """
     r = httpx.get("https://api.coingecko.com/api/v3/ping", timeout=10.0)
