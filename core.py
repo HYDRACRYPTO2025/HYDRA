@@ -15,6 +15,9 @@ import random
 from concurrent.futures import ThreadPoolExecutor
 
 
+
+HYDRA_BACKEND_URL = os.getenv("HYDRA_BACKEND_URL", "https://hydra-1ra4.onrender.com")
+
 DEXSCREENER_TIMEOUT = 10.0
 DEX_SAMPLE_TOKENS = 10000
 MAX_LOG = 2000
@@ -271,30 +274,52 @@ pancake_router = bsc_web3.eth.contract(address=PANCAKE_ROUTER, abi=PANCAKE_ROUTE
 
 def get_pancake_price_usdt(token_address: str) -> Optional[float]:
     """
-    Цена токена в USDT через DexScreener, в первую очередь по PancakeSwap.
-    Если нормальных Pancake-пулов нет — берём лучший пул вообще (uniswap и т.п.).
+    Цена токена в USDT через наш backend HYDRA,
+    который ходит в DexScreener.
+
+    Логика выбора пула остаётся той же:
+    - сначала ищем лучший PancakeSwap по ликвидности
+    - если нет Pancake, берём лучший пул вообще
     """
     addr = (token_address or "").strip()
     if not addr:
         return None
 
-    url = f"{DEXSCREENER_TOKENS_URL}/{addr}"
+    base = HYDRA_BACKEND_URL.rstrip("/")
+    url = f"{base}/price/dex_by_address"
 
     try:
-        resp = http_client.get(url, timeout=DEXSCREENER_TIMEOUT)
-        if resp.status_code != 200:
-            add_log(f"Pancake: HTTP {resp.status_code} для {addr}")
-            return None
-
-        data = resp.json()
+        resp = http_client.get(
+            url,
+            params={"address": addr},
+            timeout=DEXSCREENER_TIMEOUT,
+        )
     except Exception as e:
-        add_log(f"Pancake: ошибка запроса для {addr}: {e}")
-        proxy_mark_bad(str(e))
+        add_log(f"Pancake(back): ошибка запроса для {addr}: {e}")
+        try:
+            proxy_mark_bad(str(e))
+        except NameError:
+            pass
         return None
 
-    pairs = data.get("pairs") or []
+    if resp.status_code != 200:
+        add_log(
+            f"Pancake(back): HTTP {resp.status_code} для {addr}: "
+            f"{resp.text[:150]}"
+        )
+        return None
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        add_log(f"Pancake(back): невалидный JSON для {addr}: {e}")
+        return None
+
+    # наш backend возвращает {"status":"ok","source":"dexscreener","address":...,"raw": {...}}
+    raw = data.get("raw") or {}
+    pairs = raw.get("pairs") or []
     if not isinstance(pairs, list) or not pairs:
-        add_log(f"Pancake: нет маркетов для токена {addr}")
+        add_log(f"Pancake(back): нет маркетов для токена {addr}")
         return None
 
     def liq_usd_val(p: dict) -> float:
@@ -342,21 +367,21 @@ def get_pancake_price_usdt(token_address: str) -> Optional[float]:
         best = best_any_pair
         source = str(best.get("dexId", "unknown"))
         add_log(
-            f"Pancake: нет адекватного PancakeSwap пула для {addr}, "
+            f"Pancake(back): нет адекватного PancakeSwap пула для {addr}, "
             f"использую пул dexId={source} из DexScreener"
         )
     else:
-        add_log(f"Pancake: нет ни одного подходящего пула для {addr}")
+        add_log(f"Pancake(back): нет ни одного подходящего пула для {addr}")
         return None
 
     try:
         price = float(best.get("priceUsd"))
     except Exception as e:
-        add_log(f"Pancake: ошибка чтения priceUsd для {addr}: {e}")
+        add_log(f"Pancake(back): ошибка чтения priceUsd для {addr}: {e}")
         return None
 
     add_log(
-        f"Pancake: 1 TOKEN ({addr}) = {price:.6f} USDT (dexId={source})"
+        f"Pancake(back): 1 TOKEN ({addr}) = {price:.6f} USDT (dexId={source})"
     )
     return price
 
@@ -1016,43 +1041,53 @@ def load_saved_pairs_and_favorites() -> set:
     return favs
 
 
-def get_mexc_price(base: str, quote: str = "USDT", price_scale: Optional[int] = None) -> (
-    Optional[float], Optional[float]
-):
-    """Цена фьючерсного контракта на MEXC (USDT)."""
+def get_mexc_price(
+    base: str,
+    quote: str = "USDT",
+    price_scale: Optional[int] = None,
+) -> (Optional[float], Optional[float]):
+    """
+    Цена фьючерсного контракта на MEXC (USDT),
+    но теперь через наш backend (Render), а не напрямую в MEXC.
+    """
     symbol = f"{base.upper()}_{quote.upper()}"
+
     try:
         r = http_client.get(
-            f"{MEXC_FUTURES_BASE}/api/v1/contract/ticker",
-            params={"symbol": symbol},
+            f"{HYDRA_BACKEND_URL}/cex/mexc_price",
+            params={
+                "base": base,
+                "quote": quote,
+                "price_scale": price_scale,
+            },
+            timeout=10.0,
         )
+
+        if r.status_code != 200:
+            try:
+                txt = r.text[:200]
+            except Exception:
+                txt = "<no text>"
+            add_log(f"MEXC(back): HTTP {r.status_code} для {symbol}: {txt}")
+            return None, None
+
         j = r.json()
-        if j.get("success") and j.get("code") == 0 and j.get("data"):
-            data = j["data"]
-            bid = data.get("bid1")
-            ask = data.get("ask1")
 
-            bid_val = float(bid) if bid is not None else None
-            ask_val = float(ask) if ask is not None else None
+        bid_val = j.get("bid")
+        ask_val = j.get("ask")
 
-            # priceScale на MEXC — это КОЛИЧЕСТВО знаков после запятой, а не множитель.
-            # Используем его только для округления, но не делим на 10**priceScale.
-            if isinstance(price_scale, int) and price_scale >= 0:
-                if bid_val is not None:
-                    bid_val = round(bid_val, price_scale)
-                if ask_val is not None:
-                    ask_val = round(ask_val, price_scale)
+        bid_val = float(bid_val) if bid_val is not None else None
+        ask_val = float(ask_val) if ask_val is not None else None
 
-            add_log(f"MEXC: {symbol} bid={bid_val}, ask={ask_val} (price_scale={price_scale})")
-            return bid_val, ask_val
+        add_log(
+            f"MEXC(back): {symbol} bid={bid_val}, ask={ask_val} "
+            f"(price_scale={price_scale})"
+        )
+        return bid_val, ask_val
 
-        add_log(f"MEXC: неуспешный ответ для {symbol}: {j}")
     except Exception as e:
-        add_log(f"MEXC: ошибка для {symbol}: {e}")
-
-    return None, None
-
-    return None, None
+        add_log(f"MEXC(back): ошибка для {symbol}: {e}")
+        return None, None
 
 
 def get_pancake_price(base: str, quote: str = "USDT") -> Optional[float]:
@@ -1184,90 +1219,71 @@ def get_matcha_price_usdt(
     usdt_decimals: int = MATCHA_USDT_DECIMALS,
 ) -> Optional[float]:
     """
-    Цена 1 токена (token_address) в USDT через Matcha (0x gasless API).
+    Цена 1 токена (token_address) в USDT, но теперь через наш бекенд HYDRA,
+    который уже сам ходит на Matcha/0x.
 
-    Логика:
-      - всегда отправляем MATCHA_USDT_AMOUNT USDT (ExactIn)
-      - sellToken = USDT, buyToken = наш токен
-      - берём buyAmount (кол-во токенов)
-      - цена 1 токена = MATCHA_USDT_AMOUNT / кол-во токенов.
+    Клиент больше не стучится в matcha.xyz напрямую.
     """
-    token_address = (token_address or "").strip()
-    usdt_token = (usdt_token or "").strip()
-
-    if not token_address or not usdt_token:
-        return None
-    if token_decimals is None or token_decimals < 0:
-        return None
-    if usdt_decimals is None or usdt_decimals < 0:
+    addr = (token_address or "").strip()
+    if not addr:
         return None
 
-    # сырой sellAmount для USDT: 100 * 10^6
-    try:
-        sell_amount_raw = int(
-            MATCHA_USDT_AMOUNT * (Decimal(10) ** int(usdt_decimals))
-        )
-    except Exception:
-        return None
+    base = HYDRA_BACKEND_URL.rstrip("/")
+    url = f"{base}/price/matcha_by_address"
+
+    params = {
+        "address": addr,
+        "token_decimals": token_decimals,
+        "chain_id": chain_id,
+        "usdt_token": usdt_token,
+        "usdt_decimals": usdt_decimals,
+    }
 
     try:
-        resp = http_client.get(
-            MATCHA_PRICE_URL,
-            params={
-                "chainId": chain_id,
-                "sellToken": usdt_token,          # отдаём USDT
-                "buyToken": token_address,        # получаем наш токен
-                "sellAmount": str(sell_amount_raw),
-                "useIntents": "true",
-            },
-            headers=MATCHA_HEADERS,
-        )
-        if resp.status_code != 200:
-            add_log(
-                f"Matcha price HTTP {resp.status_code} для {token_address}: "
-                f"{resp.text[:150]}"
-            )
-            return None
-
-        data = resp.json()
-
-        s_raw = data.get("sellAmount")
-        b_raw = data.get("buyAmount")
-
-        if not s_raw or not b_raw:
-            add_log(
-                f"Matcha price: нет sellAmount/buyAmount для {token_address}"
-            )
-            return None
-
-        try:
-            s_amt = Decimal(str(s_raw))
-            b_amt = Decimal(str(b_raw))
-        except Exception as e:
-            add_log(f"Matcha price: ошибка конвертации чисел: {e}")
-            return None
-
-        if s_amt <= 0 or b_amt <= 0:
-            return None
-
-        # нормализуем количество токенов по их decimals
-        token_amount = b_amt / (Decimal(10) ** token_decimals)
-        if token_amount <= 0:
-            return None
-
-        # Цена 1 токена в USDT: 100 / кол-во токенов
-        price = MATCHA_USDT_AMOUNT / token_amount
-
-        add_log(
-            f"Matcha: 1 TOKEN ({token_address}) = {float(price):.8f} USDT "
-            f"(через {MATCHA_USDT_AMOUNT} USDT, chainId={chain_id})"
-        )
-
-        return float(price)
-
+        resp = http_client.get(url, params=params, timeout=10.0)
     except Exception as e:
-        add_log(f"Ошибка при запросе к Matcha для {token_address}: {e}")
+        add_log(f"Matcha(back): ошибка запроса для {addr}: {e}")
+        try:
+            proxy_mark_bad(str(e))
+        except NameError:
+            pass
         return None
+
+    if resp.status_code != 200:
+        try:
+            txt = resp.text[:150]
+        except Exception:
+            txt = "<no text>"
+        add_log(f"Matcha(back): HTTP {resp.status_code} для {addr}: {txt}")
+        return None
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        add_log(f"Matcha(back): невалидный JSON для {addr}: {e}")
+        return None
+
+    status = str(data.get("status", "ok")).lower()
+    if status not in ("ok", "success"):
+        add_log(f"Matcha(back): плохой статус для {addr}: {data}")
+        return None
+
+    price = data.get("price")
+    if price is None:
+        add_log(f"Matcha(back): поле 'price' не найдено в ответе для {addr}: {data}")
+        return None
+
+    try:
+        price_f = float(price)
+    except Exception as e:
+        add_log(f"Matcha(back): не удалось преобразовать price для {addr}: {e}")
+        return None
+
+    add_log(
+        f"Matcha(back): 1 TOKEN ({addr}) = {price_f:.8f} USDT "
+        f"(chainId={chain_id})"
+    )
+    return price_f
 
 
 def get_matcha_token_info(token_address: str, chain_id: int = MATCHA_CHAIN_ID) -> Optional[dict]:
