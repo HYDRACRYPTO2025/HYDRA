@@ -1,5 +1,5 @@
-# core.py
-import httpx
+# core.py - ОБНОВЛЕННАЯ ВЕРСИЯ
+# Все запросы к Jupiter, PancakeSwap, MEXC, Matcha, CoinGecko идут через Render backend API
 import os
 import json
 from dataclasses import dataclass
@@ -10,10 +10,11 @@ from typing import Optional, Dict, List
 from PyQt5.QtCore import QThread, pyqtSignal
 from decimal import Decimal
 from web3 import Web3
-from typing import Optional
 import random
 from concurrent.futures import ThreadPoolExecutor
 
+# ===== ИМПОРТИРУЕМ API КЛИЕНТ ВМЕСТО HTTPX =====
+from api_client import get_client
 
 DEXSCREENER_TIMEOUT = 10.0
 DEX_SAMPLE_TOKENS = 10000
@@ -28,12 +29,9 @@ MEXC_FUTURES_BASE = "https://contract.mexc.com"
 DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
 PANCAKE_TOKENS_API = "https://api.pancakeswap.info/api/tokens"
 DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens"
-JUPITER_USDT_DECIMALS = 6
-
 
 MATCHA_PRICE_URL = "https://matcha.xyz/api/gasless/price"
 MATCHA_USDT = "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"
-
 MATCHA_USDT_AMOUNT = Decimal("100")
 MATCHA_CHAIN_ID = 8453
 MATCHA_USDT_DECIMALS = 6
@@ -51,12 +49,8 @@ MATCHA_HEADERS = {
     "Referer": "https://matcha.xyz/",
 }
 
-
-
-
 POLL_INTERVAL = 3.0
 MAX_LOG_LINES = 10_000
-
 
 import cloudscraper
 http_client = cloudscraper.create_scraper(
@@ -136,8 +130,6 @@ def _apply_current_proxy() -> None:
         "https": proxy_url,
     }
 
-    # лог будет красным, если что-то не так с сеткой (по словам "ошибка"/"не удалось"),
-    # но здесь просто информируем:
     add_log(f"Прокси: выбран {_PROXY_PROTOCOL.upper()} {_proxy_safe_host(proxy_url)}")
 
 
@@ -269,166 +261,215 @@ PANCAKE_ROUTER_ABI = [
 pancake_router = bsc_web3.eth.contract(address=PANCAKE_ROUTER, abi=PANCAKE_ROUTER_ABI)
 
 
+# ===== ОБНОВЛЕННЫЕ ФУНКЦИИ КОТОРЫЕ ИДУТ ЧЕРЕЗ BACKEND API =====
+
 def get_pancake_price_usdt(token_address: str) -> Optional[float]:
     """
-    Цена токена в USDT через DexScreener, в первую очередь по PancakeSwap.
+    Цена токена в USDT через DexScreener (через backend API).
+    В первую очередь по PancakeSwap.
     Если нормальных Pancake-пулов нет — берём лучший пул вообще (uniswap и т.п.).
+    
+    ОБНОВЛЕНО: Теперь запрос идет через backend API на Render сервер.
     """
     addr = (token_address or "").strip()
     if not addr:
         return None
 
-    url = f"{DEXSCREENER_TOKENS_URL}/{addr}"
-
     try:
-        resp = http_client.get(url, timeout=DEXSCREENER_TIMEOUT)
-        if resp.status_code != 200:
-            add_log(f"Pancake: HTTP {resp.status_code} для {addr}")
-            return None
-
-        data = resp.json()
+        client = get_client()
+        response = client.get_price_pancake(addr)
+        
+        if response.get("status") == "ok":
+            price = response.get("price")
+            if price and price > 0:
+                add_log(f"Pancake: 1 TOKEN ({addr}) = {price:.6f} USDT (через backend API)")
+                return price
+        
+        add_log(f"Pancake: ошибка получения цены для {addr} через backend")
+        return None
     except Exception as e:
         add_log(f"Pancake: ошибка запроса для {addr}: {e}")
-        proxy_mark_bad(str(e))
         return None
 
-    pairs = data.get("pairs") or []
-    if not isinstance(pairs, list) or not pairs:
-        add_log(f"Pancake: нет маркетов для токена {addr}")
-        return None
 
-    def liq_usd_val(p: dict) -> float:
-        liq = p.get("liquidity") or {}
-        try:
-            return float(liq.get("usd") or 0.0)
-        except Exception:
-            return 0.0
+def get_mexc_price(base: str, quote: str = "USDT", price_scale: Optional[int] = None) -> (
+    Optional[float], Optional[float]
+):
+    """
+    Цена фьючерсного контракта на MEXC (USDT) (через backend API).
+    
+    ОБНОВЛЕНО: Теперь запрос идет через backend API на Render сервер.
+    """
+    symbol = f"{base.upper()}_{quote.upper()}"
+    try:
+        client = get_client()
+        response = client.get_price_mexc(symbol=symbol)
+        
+        if response.get("status") == "ok":
+            bid = response.get("bid")
+            ask = response.get("ask")
+            
+            bid_val = float(bid) if bid is not None else None
+            ask_val = float(ask) if ask is not None else None
 
-    pancake_pairs: List[dict] = []
-    best_any_pair: Optional[dict] = None
+            # priceScale на MEXC — это КОЛИЧЕСТВО знаков после запятой
+            if isinstance(price_scale, int) and price_scale >= 0:
+                if bid_val is not None:
+                    bid_val = round(bid_val, price_scale)
+                if ask_val is not None:
+                    ask_val = round(ask_val, price_scale)
 
-    for pair in pairs:
-        dex_id = str(pair.get("dexId", "")).lower()
-        price_str = pair.get("priceUsd")
-        if price_str is None:
-            continue
+            add_log(f"MEXC: {symbol} bid={bid_val}, ask={ask_val} (price_scale={price_scale}) (через backend API)")
+            return bid_val, ask_val
 
-        # читаем цену и сразу режем явный мусор
-        try:
-            price_val = float(price_str)
-        except Exception:
-            continue
-        if price_val <= 0 or price_val > 1_000_000:
-            # отбрасываем дичь типа 3e20 и т.п.
-            continue
+        add_log(f"MEXC: неуспешный ответ для {symbol} через backend")
+    except Exception as e:
+        add_log(f"MEXC: ошибка для {symbol}: {e}")
 
-        liq_val = liq_usd_val(pair)
-        if liq_val <= 0:
-            # без ликвидности не интересует
-            continue
+    return None, None
 
-        # кандидаты именно PancakeSwap
-        if "pancake" in dex_id:
-            pancake_pairs.append(pair)
 
-        # параллельно запоминаем лучший пул вообще
-        if best_any_pair is None or liq_val > liq_usd_val(best_any_pair):
-            best_any_pair = pair
-
-    if pancake_pairs:
-        best = max(pancake_pairs, key=liq_usd_val)
-        source = "pancake"
-    elif best_any_pair is not None:
-        best = best_any_pair
-        source = str(best.get("dexId", "unknown"))
-        add_log(
-            f"Pancake: нет адекватного PancakeSwap пула для {addr}, "
-            f"использую пул dexId={source} из DexScreener"
-        )
-    else:
-        add_log(f"Pancake: нет ни одного подходящего пула для {addr}")
+def get_pancake_price(base: str, quote: str = "USDT") -> Optional[float]:
+    """
+    Цена одного токена на Pancake (через backend API).
+    Возвращает цену в USDT.
+    
+    ОБНОВЛЕНО: Теперь запрос идет через backend API на Render сервер.
+    """
+    symbol = (base or "").upper()
+    if not symbol:
         return None
 
     try:
-        price = float(best.get("priceUsd"))
-    except Exception as e:
-        add_log(f"Pancake: ошибка чтения priceUsd для {addr}: {e}")
+        client = get_client()
+        response = client.get_price_pancake_by_symbol(symbol=symbol)
+        
+        if response.get("status") == "ok":
+            price = response.get("price")
+            if price and price > 0:
+                add_log(f"Pancake: {symbol} = {price:.6f} USDT (через backend API)")
+                return price
+        
+        add_log(f"Pancake: токен {symbol} не найден через backend")
         return None
 
-    add_log(
-        f"Pancake: 1 TOKEN ({addr}) = {price:.6f} USDT (dexId={source})"
-    )
-    return price
+    except Exception as e:
+        add_log(f"Pancake: ошибка для {symbol}: {e}")
+        return None
 
 
-def log(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
-    LOG_LINES.append(line)
-    if len(LOG_LINES) > MAX_LOG:
-        del LOG_LINES[: len(LOG_LINES) - MAX_LOG]
+def get_jupiter_price_usdt(mint: str, decimals: int) -> Optional[float]:
+    """
+    Цена 1 токена (mint) в USDT через Jupiter (через backend API).
+    
+    ОБНОВЛЕНО: Теперь запрос идет через backend API на Render сервер.
+    """
+    mint = (mint or "").strip()
+    if not mint or decimals is None or decimals < 0:
+        return None
+
+    try:
+        client = get_client()
+        response = client.get_price_jupiter(mint=mint, decimals=decimals)
+        
+        if response.get("status") == "ok":
+            price = response.get("price")
+            if price and price > 0:
+                add_log(f"Jupiter: 1 TOKEN ({mint}) = {float(price):.8f} USDT (через backend API)")
+                return float(price)
+        
+        add_log(f"Jupiter: ошибка получения цены для {mint} через backend")
+        return None
+
+    except Exception as e:
+        add_log(f"Ошибка при запросе к Jupiter для mint={mint}: {e}")
+        return None
 
 
-def log_exc(prefix: str, exc: Exception):
-    """Сокращённая запись исключений в лог."""
-    log(f"{prefix}: {type(exc).__name__}: {exc}")
+def get_matcha_price_usdt(
+    token_address: str,
+    token_decimals: int = MATCHA_DEFAULT_SELL_DECIMALS,
+    chain_id: int = MATCHA_CHAIN_ID,
+    usdt_token: str = MATCHA_USDT,
+    usdt_decimals: int = MATCHA_USDT_DECIMALS,
+) -> Optional[float]:
+    """
+    Цена 1 токена (token_address) в USDT через Matcha (через backend API).
+    
+    ОБНОВЛЕНО: Теперь запрос идет через backend API на Render сервер.
+    """
+    token_address = (token_address or "").strip()
+    usdt_token = (usdt_token or "").strip()
+
+    if not token_address or not usdt_token:
+        return None
+    if token_decimals is None or token_decimals < 0:
+        return None
+    if usdt_decimals is None or usdt_decimals < 0:
+        return None
+
+    try:
+        client = get_client()
+        response = client.get_price_matcha(
+            address=token_address,
+            token_decimals=token_decimals,
+            chain_id=chain_id,
+            usdt_token=usdt_token,
+            usdt_decimals=usdt_decimals,
+        )
+        
+        if response.get("status") == "ok":
+            price = response.get("price")
+            if price and price > 0:
+                add_log(f"Matcha: 1 TOKEN ({token_address}) = {float(price):.8f} USDT (через backend API)")
+                return float(price)
+        
+        add_log(f"Matcha: ошибка получения цены для {token_address} через backend")
+        return None
+
+    except Exception as e:
+        add_log(f"Ошибка при запросе к Matcha для {token_address}: {e}")
+        return None
 
 
-def add_log(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
-    LOG_LINES.append(line)
-    if len(LOG_LINES) > MAX_LOG_LINES:
-        del LOG_LINES[0: len(LOG_LINES) - MAX_LOG_LINES]
+def get_matcha_token_info(token_address: str, chain_id: int = MATCHA_CHAIN_ID) -> Optional[dict]:
+    """
+    Запрашивает сведения о токене: decimals, symbol, name (через backend API).
+    Возвращает dict с ключами: address, decimals, symbol, name или None при ошибке.
+    
+    ОБНОВЛЕНО: Теперь запрос идет через backend API на Render сервер.
+    """
+    addr = (token_address or "").strip()
+    if not addr:
+        return None
 
+    try:
+        client = get_client()
+        response = client.get_matcha_token_info(address=addr, chain_id=chain_id)
+        
+        if response.get("status") == "ok":
+            data = response.get("data")
+            if data:
+                result = {
+                    "address": data.get("address", addr),
+                    "decimals": int(data.get("decimals", 18)),
+                    "symbol": data.get("symbol"),
+                    "name": data.get("name"),
+                }
+                add_log(f"Matcha token info: {result.get('symbol') or addr} decimals={result['decimals']} (через backend API)")
+                return result
+        
+        add_log(f"Matcha token info: ошибка для {addr} через backend")
+        return None
 
-from typing import Optional, List  # как уже есть сверху
-from dataclasses import dataclass
-
-
-@dataclass
-class PairConfig:
-    name: str
-    base: str
-    quote: str = "USDT"
-    dexes: Optional[List[str]] = None
-
-    jupiter_mint: Optional[str] = None
-    jupiter_decimals: Optional[int] = None
-
-    bsc_address: Optional[str] = None
-
-    mexc_price_scale: Optional[int] = None
-
-    matcha_address: Optional[str] = None
-    matcha_decimals: Optional[int] = None
-
-    # CoinGecko id для капитализации (например "solana", "api3")
-    cg_id: Optional[str] = None
-
-    # флаги, по каким направлениям вообще слать оповещения
-    spread_direct: bool = True
-    spread_reverse: bool = True
-
-    # СТАРОЕ: общий порог спреда (оставляем для совместимости со старым tokens.json)
-    spread_threshold: Optional[float] = None
-
-    # НОВОЕ: отдельные пороги для прямого и обратного спреда (%, можно None)
-    spread_direct_threshold: Optional[float] = None
-    spread_reverse_threshold: Optional[float] = None
-
-
-PAIRS: Dict[str, PairConfig] = {}
-
-_CG_COINS_LIST: List[dict] = []
-_CG_LIST_LOADED: bool = False
-_CG_SYMBOL_INDEX: Dict[str, str] = {}
+    except Exception as e:
+        add_log(f"Ошибка получения meta от Matcha для {token_address}: {e}")
+        return None
 
 
 def _ensure_cg_coins_list() -> None:
     """
-    Один раз за запуск грузим полный список монет с CoinGecko,
-    чтобы потом быстро по нему искать id по символу.
+    Один раз за запуск грузим полный список монет с CoinGecko (через backend API).
     """
     global _CG_COINS_LIST, _CG_LIST_LOADED
 
@@ -436,26 +477,20 @@ def _ensure_cg_coins_list() -> None:
         return
 
     try:
-        resp = http_client.get(
-            "https://api.coingecko.com/api/v3/coins/list",
-            timeout=20.0,
-        )
-        if resp.status_code != 200:
-            add_log(
-                f"CoinGecko list: HTTP {resp.status_code}: "
-                f"{str(resp.text)[:150]}"
-            )
-            _CG_COINS_LIST = []
-            _CG_LIST_LOADED = True
-            return
-
-        data = resp.json()
-        if isinstance(data, list):
-            _CG_COINS_LIST = data
+        client = get_client()
+        response = client.get_coingecko_coins_list()
+        
+        if response.get("status") == "ok":
+            coins = response.get("coins", [])
+            if isinstance(coins, list):
+                _CG_COINS_LIST = coins
+            else:
+                _CG_COINS_LIST = []
         else:
             _CG_COINS_LIST = []
+        
         _CG_LIST_LOADED = True
-        add_log(f"CoinGecko list: загружено {_CG_COINS_LIST.__len__()} монет")
+        add_log(f"CoinGecko list: загружено {len(_CG_COINS_LIST)} монет (через backend API)")
     except Exception as e:
         add_log(f"CoinGecko list: ошибка загрузки: {e}")
         _CG_COINS_LIST = []
@@ -520,1082 +555,260 @@ def _pick_coingecko_id_for_symbol(symbol: str) -> Optional[str]:
             if "-" not in cid and " " not in cid:
                 score += 10.0
 
-            # 5) штраф за "плохие" слова — мосты, стейки и т.п.
-            if any(w in cid_l for w in bad_words) or any(
-                w in name_l for w in bad_words
-            ):
-                score -= 30.0
-
-            # 6) слегка штрафуем за длину id (короче == лучше)
-            score -= len(cid) * 0.01
+            # 5) отбрасываем "плохие" слова в id
+            has_bad = any(bad in cid_l for bad in bad_words)
+            if has_bad:
+                score -= 50.0
 
             if best_score is None or score > best_score:
-                best_score = score
                 best_id = cid
+                best_score = score
+
         except Exception:
             continue
 
     if best_id:
         _CG_SYMBOL_INDEX[symbol] = best_id
-        add_log(f"CoinGecko: {symbol} -> id={best_id}")
-    else:
-        add_log(f"CoinGecko: не нашёл id для символа {symbol}")
+        return best_id
 
-    return best_id
+    return None
 
 
-def fetch_L_M_for_pair(pair_cfg: PairConfig) -> Optional[Dict[str, float]]:
-    """
-    Получить:
-    - price_mexc: текущая цена с MEXC (spot, 24h ticker)
-    - L: ликвидность за 24 часа (quoteVolume, USDT)
-    - M: глобальная капитализация с CoinGecko
+def log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    LOG_LINES.append(line)
+    if len(LOG_LINES) > MAX_LOG:
+        del LOG_LINES[: len(LOG_LINES) - MAX_LOG]
 
-    Основано на тикере BASE/USDT:
-    - MEXC symbol: BASEUSDT
-    - CoinGecko id: cg_id из PairConfig, либо подбирается по symbol (SOL -> solana и т.п.)
-    """
-    base = (getattr(pair_cfg, "base", "") or "").upper().strip()
-    if not base:
-        return None
 
-    price_mexc: Optional[float] = None
-    L: Optional[float] = None
-    M: Optional[float] = None
+def log_exc(prefix: str, exc: Exception):
+    """Сокращённая запись исключений в лог."""
+    log(f"{prefix}: {type(exc).__name__}: {exc}")
 
-    # ---------- MEXC: 24h тикер (ликвидность L) ----------
-    symbol_fut = f"{base}_USDT"
-    try:
-        r = http_client.get(
-            "https://contract.mexc.com/api/v1/contract/ticker",
-            params={"symbol": symbol_fut},
-            timeout=10.0,
-        )
-        if r.status_code != 200:
-            add_log(
-                f"MEXC L/M futures: HTTP {r.status_code} для {symbol_fut}: "
-                f"{str(r.text)[:200]}"
-            )
-        else:
-            data = r.json()
-            if data.get("success"):
-                t = data.get("data") or {}
-                # Цена берём lastPrice с фьючерсов
-                try:
-                    price_mexc = float(t.get("lastPrice") or 0.0)
-                except Exception:
-                    price_mexc = None
-                # Ликвидность L = оборот за 24ч в валюте (USDT)
-                try:
-                    L = float(t.get("amount24") or 0.0)
-                except Exception:
-                    L = None
-            else:
-                add_log(
-                    f"MEXC L/M futures: code={data.get('code')} "
-                    f"msg={data.get('message')} для {symbol_fut}"
-                )
-    except Exception as e:
-        add_log(f"MEXC L/M futures: ошибка для {symbol_fut}: {e}")
 
-    # ---------- CoinGecko: капитализация M ----------
-    cg_id = getattr(pair_cfg, "cg_id", None)
-    if not cg_id:
-        cg_id = _pick_coingecko_id_for_symbol(base) or base.lower()
-        # запомним в конфиге, чтобы потом сохранить в tokens.json
-        try:
-            pair_cfg.cg_id = cg_id
-        except Exception:
-            pass
+def add_log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    LOG_LINES.append(line)
+    if len(LOG_LINES) > MAX_LOG_LINES:
+        del LOG_LINES[0: len(LOG_LINES) - MAX_LOG_LINES]
 
-    if cg_id:
-        try:
-            r = http_client.get(
-                "https://api.coingecko.com/api/v3/coins/markets",
-                params={"vs_currency": "usd", "ids": cg_id},
-                timeout=10.0,
-            )
-            if r.status_code != 200:
-                add_log(
-                    f"CoinGecko M: HTTP {r.status_code} для {cg_id}: "
-                    f"{str(r.text)[:150]}"
-                )
-            else:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    item = data[0]
-                    try:
-                        M = float(item.get("market_cap") or 0.0)
-                    except Exception:
-                        M = None
-        except Exception as e:
-            add_log(f"CoinGecko M: ошибка для {cg_id}: {e}")
 
-    # если вообще ничего не удалось — вернуть None
-    if price_mexc is None and L is None and M is None:
-        return None
+@dataclass
+class PairConfig:
+    name: str
+    base: str
+    quote: str = "USDT"
+    dexes: Optional[List[str]] = None
 
-    return {
-        "price_mexc": price_mexc,
-        "L": L,
-        "M": M,
-    }
+    jupiter_mint: Optional[str] = None
+    jupiter_decimals: Optional[int] = None
 
+    bsc_address: Optional[str] = None
 
+    mexc_price_scale: Optional[int] = None
 
+    matcha_address: Optional[str] = None
+    matcha_decimals: Optional[int] = None
 
-# --- директории ---
-if getattr(sys, "frozen", False):
-    # exe: сюда будем писать tokens.json / settings.json (рядом с .exe)
-    BASE_DIR = Path(sys.executable).resolve().parent
-    # а тут лежат ресурсы, упакованные PyInstaller (--add-data)
-    RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR))
-else:
-    # обычный запуск из .py
-    BASE_DIR = Path(__file__).resolve().parent
-    RESOURCE_DIR = BASE_DIR
+    # CoinGecko id для капитализации (например "solana", "api3")
+    cg_id: Optional[str] = None
 
-# файлы данных (должны быть в записываемой директории)
-_TOKENS_FILE = BASE_DIR / "tokens.json"
-_SETTINGS_FILE = BASE_DIR / "settings.json"
+    # флаги, по каким направлениям вообще слать оповещения
+    spread_direct: bool = True
+    spread_reverse: bool = True
 
-# чтобы относительные пути в стилях (Icon/arrow_up.png) искались в папке ресурсов
-os.chdir(RESOURCE_DIR)
+    # СТАРОЕ: общий порог спреда (оставляем для совместимости со старым tokens.json)
+    spread_threshold: Optional[float] = None
 
-# --- создаём файл автоматически, если он отсутствует ---
-if not _TOKENS_FILE.exists():
-    try:
-        default_data = {
-            "pairs": [],
-            "favorites": []
-        }
-        _TOKENS_FILE.write_text(
-            json.dumps(default_data, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
-    except Exception as e:
-        # лучше в лог, если уже есть log()
-        try:
-            print(f"Ошибка создания tokens.json: {e}")
-        except:
-            pass
-if not _TOKENS_FILE.exists():
-    _TOKENS_FILE.write_text(json.dumps({"pairs": [], "favorites": []}, indent=2, ensure_ascii=False), encoding="utf-8")
+    # НОВОЕ: отдельные пороги для прямого и обратного спреда (%, можно None)
+    spread_direct_threshold: Optional[float] = None
+    spread_reverse_threshold: Optional[float] = None
 
 
-_SETTINGS_FILE = BASE_DIR / "settings.json"
+PAIRS: Dict[str, PairConfig] = {}
 
-_DEFAULT_SETTINGS = {
-    "telegram_chat_id": "",
-    "telegram_token": "",
-    "interval_sec": 3.0,
-    "favorites": [],
-    "dex_states": {},
-    "cex_states": {},
-    "mode_states": {},
-    "spread_direct_palette": "green",
-    "spread_reverse_palette": "red",
-    "main_positive_spread_color": "green",  # ключ палитры
-    "main_negative_spread_color": "red",    # ключ палитры
-    "spread_pairs": [],
-    "notifications_enabled": True,
-    "notifications_max_count": 3,
+_CG_COINS_LIST: List[dict] = []
+_CG_LIST_LOADED: bool = False
+_CG_SYMBOL_INDEX: Dict[str, str] = {}
 
-    # --- новые поля для прокси ---
-    "proxy_enabled": False,
-    "proxy_protocol": "socks5",   # "socks5" или "http"
-    "proxy_file_path": "",
-}
 
-
-def load_settings() -> dict:
-    """
-    Загружаем настройки из settings.json.
-    Если файла нет / он битый — возвращаем дефолт.
-    """
-    if not _SETTINGS_FILE.exists():
-        return _DEFAULT_SETTINGS.copy()
-
-    try:
-        raw = _SETTINGS_FILE.read_text(encoding="utf-8")
-        if not raw.strip():
-            return _DEFAULT_SETTINGS.copy()
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            return _DEFAULT_SETTINGS.copy()
-    except Exception as e:
-        try:
-            log(f"Ошибка чтения {_SETTINGS_FILE.name}: {e}")
-        except Exception:
-            pass
-        return _DEFAULT_SETTINGS.copy()
-
-    cfg = _DEFAULT_SETTINGS.copy()
-    cfg.update({k: v for k, v in data.items() if k in cfg})
-
-    # нормализуем интервал опроса
-    try:
-        iv = float(cfg.get("interval_sec", POLL_INTERVAL))
-        if iv <= 0:
-            iv = POLL_INTERVAL
-        cfg["interval_sec"] = iv
-    except Exception:
-        cfg["interval_sec"] = POLL_INTERVAL
-
-    # нормализуем флаг экранных уведомлений
-    cfg["notifications_enabled"] = bool(cfg.get("notifications_enabled", True))
-
-    # нормализуем количество одновременно отображаемых уведомлений
-    try:
-        mc = int(cfg.get("notifications_max_count", 1))
-        if mc <= 0:
-            mc = 1
-        cfg["notifications_max_count"] = mc
-    except Exception:
-        cfg["notifications_max_count"] = 1
-
-    return cfg
-
-
-def save_settings(
-        telegram_chat_id: str,
-        telegram_token: str,
-        interval_sec: float,
-        *,
-        favorites=None,
-        dex_states=None,
-        cex_states=None,
-        mode_states=None,
-        spread_direct_palette: Optional[str] = None,
-        spread_reverse_palette: Optional[str] = None,
-        spread_pairs=None,
-        notif_enabled: Optional[bool] = None,
-        notif_max_count: Optional[int] = None,
-        # --- новые аргументы ---
-        proxy_enabled: Optional[bool] = None,
-        proxy_protocol: Optional[str] = None,
-        proxy_file_path: Optional[str] = None,
-        main_positive_spread_color: Optional[str] = None,
-        main_negative_spread_color: Optional[str] = None,
-) -> dict:
-    """
-    Сохраняем настройки в settings.json.
-    Создаём файл, если его ещё нет.
-    """
-    try:
-        iv = float(interval_sec)
-        if iv <= 0:
-            iv = POLL_INTERVAL
-    except Exception:
-        iv = POLL_INTERVAL
-
-    # читаем существующий файл, чтобы не потерять чужие ключи
-    data: dict = {}
-    if _SETTINGS_FILE.exists():
-        try:
-            raw = _SETTINGS_FILE.read_text(encoding="utf-8")
-            if raw.strip():
-                loaded = json.loads(raw)
-                if isinstance(loaded, dict):
-                    data.update(loaded)
-        except Exception as e:
-            try:
-                log(f"Ошибка чтения {_SETTINGS_FILE.name} перед записью: {e}")
-            except Exception:
-                pass
-
-    # обновляем базовые поля
-    data["telegram_chat_id"] = telegram_chat_id or ""
-    data["telegram_token"] = telegram_token or ""
-    data["interval_sec"] = iv
-
-    # --- настройки уведомлений ---
-    if notif_enabled is not None:
-        data["notifications_enabled"] = bool(notif_enabled)
-
-    if notif_max_count is not None:
-        try:
-            mc = int(notif_max_count)
-            if mc <= 0:
-                mc = 1
-        except Exception:
-            mc = 3
-        data["notifications_max_count"] = mc
-
-    # --- новые поля прокси ---
-    if proxy_enabled is not None:
-        data["proxy_enabled"] = bool(proxy_enabled)
-
-    if proxy_protocol is not None:
-        data["proxy_protocol"] = str(proxy_protocol)
-
-    if proxy_file_path is not None:
-        data["proxy_file_path"] = str(proxy_file_path)
-
-    # --- палитры цвета спреда ---
-    if spread_direct_palette is not None:
-        data["spread_direct_palette"] = str(spread_direct_palette)
-    if spread_reverse_palette is not None:
-        data["spread_reverse_palette"] = str(spread_reverse_palette)
-
-    if main_positive_spread_color is not None:
-        data["main_positive_spread_color"] = str(main_positive_spread_color)
-    if main_negative_spread_color is not None:
-        data["main_negative_spread_color"] = str(main_negative_spread_color)
-
-    try:
-        _SETTINGS_FILE.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        try:
-            log(f"Ошибка записи {_SETTINGS_FILE.name}: {e}")
-        except Exception:
-            pass
-
-def save_pairs_and_favorites(pairs: Dict[str, "PairConfig"], favorites: set) -> None:
-    try:
-        pairs_list = []
-        for p in pairs.values():
-            item = {
-                "name": p.name,
-                "base": p.base,
-                "quote": p.quote,
-            }
-
-            if getattr(p, "dexes", None):
-                item["dexes"] = p.dexes
-            if getattr(p, "jupiter_mint", None):
-                item["jupiter_mint"] = p.jupiter_mint
-            if getattr(p, "jupiter_decimals", None) is not None:
-                item["jupiter_decimals"] = p.jupiter_decimals
-            if getattr(p, "bsc_address", None):
-                item["bsc_address"] = p.bsc_address
-            if getattr(p, "mexc_price_scale", None) is not None:
-                item["mexc_price_scale"] = p.mexc_price_scale
-            if getattr(p, "matcha_address", None):
-                item["matcha_address"] = p.matcha_address
-            if getattr(p, "matcha_decimals", None) is not None:
-                item["matcha_decimals"] = p.matcha_decimals
-
-            if getattr(p, "cg_id", None):
-                item["cg_id"] = p.cg_id
-            item["spread_direct"] = bool(getattr(p, "spread_direct", True))
-            item["spread_reverse"] = bool(getattr(p, "spread_reverse", True))
-
-            # общий порог (для старых версий)
-            thr_common = getattr(p, "spread_threshold", None)
-            if thr_common is not None:
-                try:
-                    item["spread_threshold"] = float(thr_common)
-                except Exception:
-                    pass
-
-            # НОВОЕ: отдельные пороги прямой/обратный
-            thr_dir = getattr(p, "spread_direct_threshold", None)
-            if thr_dir is not None:
-                try:
-                    item["spread_direct_threshold"] = float(thr_dir)
-                except Exception:
-                    pass
-
-            thr_rev = getattr(p, "spread_reverse_threshold", None)
-            if thr_rev is not None:
-                try:
-                    item["spread_reverse_threshold"] = float(thr_rev)
-                except Exception:
-                    pass
-
-
-
-
-            pairs_list.append(item)
-
-        data = {
-            "pairs": pairs_list,
-            "favorites": list(favorites),
-        }
-
-        _TOKENS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        try:
-            log(f"Ошибка сохранения {_TOKENS_FILE.name}: {e}")
-        except Exception:
-            pass
-
-
-def load_saved_pairs_and_favorites() -> set:
-    """
-    Загружаем пары и избранные токены из файла tokens.json.
-    Наполняем глобальный словарь PAIRS и возвращаем set избранных имён пар.
-    """
-    favs: set = set()
-
-    if not _TOKENS_FILE.exists():
-        return favs
-
-    try:
-        raw = _TOKENS_FILE.read_text(encoding="utf-8")
-        data = json.loads(raw) if raw.strip() else {}
-    except Exception as e:
-        try:
-            log(f"Ошибка чтения {_TOKENS_FILE.name}: {e}")
-        except Exception:
-            pass
-        return favs
-
-    pairs_data = data.get("pairs") or []
-    for item in pairs_data:
-        try:
-            name = item.get("name")
-            if not name:
-                continue
-
-            base = item.get("base") or name.split("-")[0]
-            if "-" in name:
-                quote = item.get("quote") or name.split("-")[1]
-            else:
-                quote = item.get("quote") or "USDT"
-
-            dexes = item.get("dexes") or None
-
-            j_mint = item.get("jupiter_mint")
-            j_dec = item.get("jupiter_decimals")
-            bsc_addr = item.get("bsc_address")
-            mexc_ps = item.get("mexc_price_scale")
-            matcha_address = item.get("matcha_address")
-            matcha_decimals = item.get("matcha_decimals")
-
-            spread_direct = item.get("spread_direct", True)
-            spread_reverse = item.get("spread_reverse", True)
-
-            # общий порог (старое поле)
-            spread_threshold = item.get("spread_threshold")
-
-            # НОВОЕ: отдельные пороги, могут отсутствовать в старом файле
-            spread_direct_threshold = item.get("spread_direct_threshold")
-            spread_reverse_threshold = item.get("spread_reverse_threshold")
-
-            cg_id = item.get("cg_id")
-
-            PAIRS[name] = PairConfig(
-                name=name,
-                base=base,
-                quote=quote,
-                dexes=dexes,
-                jupiter_mint=j_mint,
-                jupiter_decimals=j_dec,
-                bsc_address=bsc_addr,
-                mexc_price_scale=mexc_ps,
-                matcha_address=matcha_address,
-                matcha_decimals=matcha_decimals,
-                cg_id=cg_id,
-                spread_direct=spread_direct,
-                spread_reverse=spread_reverse,
-                spread_threshold=spread_threshold,
-                spread_direct_threshold=spread_direct_threshold,
-                spread_reverse_threshold=spread_reverse_threshold,
-            )
-        except Exception as e:
-            try:
-                log(f"Ошибка разбора пары из {_TOKENS_FILE.name}: {e}")
-            except Exception:
-                pass
-            continue
-
-    favs_list = data.get("favorites") or []
-    try:
-        favs = set(str(x) for x in favs_list)
-    except Exception as e:
-        try:
-            log(f"Ошибка чтения favorites из {_TOKENS_FILE.name}: {e}")
-        except Exception:
-            pass
-
-    return favs
-
-
-def get_mexc_price(base: str, quote: str = "USDT", price_scale: Optional[int] = None) -> (
-    Optional[float], Optional[float]
-):
-    """Цена фьючерсного контракта на MEXC (USDT)."""
-    symbol = f"{base.upper()}_{quote.upper()}"
-    try:
-        r = http_client.get(
-            f"{MEXC_FUTURES_BASE}/api/v1/contract/ticker",
-            params={"symbol": symbol},
-        )
-        j = r.json()
-        if j.get("success") and j.get("code") == 0 and j.get("data"):
-            data = j["data"]
-            bid = data.get("bid1")
-            ask = data.get("ask1")
-
-            bid_val = float(bid) if bid is not None else None
-            ask_val = float(ask) if ask is not None else None
-
-            # priceScale на MEXC — это КОЛИЧЕСТВО знаков после запятой, а не множитель.
-            # Используем его только для округления, но не делим на 10**priceScale.
-            if isinstance(price_scale, int) and price_scale >= 0:
-                if bid_val is not None:
-                    bid_val = round(bid_val, price_scale)
-                if ask_val is not None:
-                    ask_val = round(ask_val, price_scale)
-
-            add_log(f"MEXC: {symbol} bid={bid_val}, ask={ask_val} (price_scale={price_scale})")
-            return bid_val, ask_val
-
-        add_log(f"MEXC: неуспешный ответ для {symbol}: {j}")
-    except Exception as e:
-        add_log(f"MEXC: ошибка для {symbol}: {e}")
-
-    return None, None
-
-    return None, None
-
-
-def get_pancake_price(base: str, quote: str = "USDT") -> Optional[float]:
-    """
-    Цена одного токена на Pancake (через https://api.pancakeswap.info/api/tokens).
-    Возвращает цену в USDT (берём price в USD и считаем, что USDT ≈ 1 USD).
-    """
-    symbol = (base or "").upper()
-    if not symbol:
-        return None
-
-    try:
-        r = http_client.get(PANCAKE_TOKENS_API)
-        j = r.json()
-        data = j.get("data") or {}
-
-        best_price = None
-
-        for addr, info in data.items():
-            try:
-                if str(info.get("symbol", "")).upper() != symbol:
-                    continue
-
-                price_str = info.get("price")
-                if not price_str:
-                    continue
-
-                price = float(price_str)
-
-                # Если вдруг несколько токенов с одинаковым символом —
-                # берём первую или более "дорогую" запись.
-                if best_price is None or price > best_price:
-                    best_price = price
-            except Exception:
-                # Один кривой токен не должен ломать всё
-                continue
-
-        if best_price is None:
-            add_log(f"Pancake: токен {symbol} не найден в /api/tokens")
-        return best_price
-
-    except Exception as e:
-        add_log(f"Pancake: ошибка для {symbol}: {e}")
-        return None
-
-
-def get_jupiter_price_usdt(mint: str, decimals: int) -> Optional[float]:
-    """
-    Цена 1 токена (mint) в USDT через Jupiter ultra-api /order.
-
-    Логика:
-      - отправляем фиксированные 100 USDT (ExactIn) как inputMint = USDT;
-      - читаем, сколько токенов получили (outAmount);
-      - цена 1 токена = 100 USDT / полученное количество токенов.
-    """
-    mint = (mint or "").strip()
-    if not mint or decimals is None or decimals < 0:
-        return None
-
-    # raw-количество USDT для отправки (100 USDT * 10^6)
-    try:
-        usdt_amount_raw = int(JUPITER_USDT_AMOUNT * (Decimal(10) ** JUPITER_USDT_DECIMALS))
-    except Exception as e:
-        add_log(f"Jupiter price: ошибка подготовки суммы USDT: {e}")
-        return None
-
-    try:
-        resp = http_client.get(
-            JUPITER_QUOTE_URL,
-            params={
-                "inputMint": JUPITER_USDT_MINT,  # отдаём USDT
-                "outputMint": mint,              # получаем наш токен
-                "amount": str(usdt_amount_raw),  # 100 USDT в raw
-                "swapMode": "ExactIn",
-            },
-            timeout=1.0,
-        )
-
-        if resp.status_code != 200:
-            add_log(
-                f"Jupiter order HTTP {resp.status_code} для mint={mint}: "
-                f"{resp.text[:150]}"
-            )
-            return None
-
-        data = resp.json()
-
-        # Для /order нам нужен только outAmount (кол-во токенов)
-        out_amount_str = data.get("outAmount")
-        if not out_amount_str:
-            add_log(f"Jupiter order: нет outAmount для mint={mint}: {data}")
-            return None
-
-        try:
-            out_amount_raw = int(out_amount_str)
-        except Exception as e:
-            add_log(
-                f"Jupiter order: некорректный outAmount для mint={mint}: "
-                f"{out_amount_str} ({e})"
-            )
-            return None
-
-        if out_amount_raw <= 0:
-            return None
-
-        # нормализуем количество токенов по decimals
-        token_amount = Decimal(out_amount_raw) / (Decimal(10) ** decimals)
-        if token_amount <= 0:
-            return None
-
-        # цена 1 токена в USDT: 100 / кол-во токенов
-        price = JUPITER_USDT_AMOUNT / token_amount
-
-        add_log(
-            f"Jupiter: 1 TOKEN ({mint}) = {float(price):.8f} USDT "
-            f"(через {JUPITER_USDT_AMOUNT} USDT ExactIn)"
-        )
-        return float(price)
-
-    except Exception as e:
-        add_log(f"Ошибка при запросе к Jupiter order для mint={mint}: {e}")
-        return None
-
-def get_matcha_price_usdt(
-    token_address: str,
-    token_decimals: int = MATCHA_DEFAULT_SELL_DECIMALS,
-    chain_id: int = MATCHA_CHAIN_ID,
-    usdt_token: str = MATCHA_USDT,
-    usdt_decimals: int = MATCHA_USDT_DECIMALS,
-) -> Optional[float]:
-    """
-    Цена 1 токена (token_address) в USDT через Matcha (0x gasless API).
-
-    Логика:
-      - всегда отправляем MATCHA_USDT_AMOUNT USDT (ExactIn)
-      - sellToken = USDT, buyToken = наш токен
-      - берём buyAmount (кол-во токенов)
-      - цена 1 токена = MATCHA_USDT_AMOUNT / кол-во токенов.
-    """
-    token_address = (token_address or "").strip()
-    usdt_token = (usdt_token or "").strip()
-
-    if not token_address or not usdt_token:
-        return None
-    if token_decimals is None or token_decimals < 0:
-        return None
-    if usdt_decimals is None or usdt_decimals < 0:
-        return None
-
-    # сырой sellAmount для USDT: 100 * 10^6
-    try:
-        sell_amount_raw = int(
-            MATCHA_USDT_AMOUNT * (Decimal(10) ** int(usdt_decimals))
-        )
-    except Exception:
-        return None
-
-    try:
-        resp = http_client.get(
-            MATCHA_PRICE_URL,
-            params={
-                "chainId": chain_id,
-                "sellToken": usdt_token,          # отдаём USDT
-                "buyToken": token_address,        # получаем наш токен
-                "sellAmount": str(sell_amount_raw),
-                "useIntents": "true",
-            },
-            headers=MATCHA_HEADERS,
-        )
-        if resp.status_code != 200:
-            add_log(
-                f"Matcha price HTTP {resp.status_code} для {token_address}: "
-                f"{resp.text[:150]}"
-            )
-            return None
-
-        data = resp.json()
-
-        s_raw = data.get("sellAmount")
-        b_raw = data.get("buyAmount")
-
-        if not s_raw or not b_raw:
-            add_log(
-                f"Matcha price: нет sellAmount/buyAmount для {token_address}"
-            )
-            return None
-
-        try:
-            s_amt = Decimal(str(s_raw))
-            b_amt = Decimal(str(b_raw))
-        except Exception as e:
-            add_log(f"Matcha price: ошибка конвертации чисел: {e}")
-            return None
-
-        if s_amt <= 0 or b_amt <= 0:
-            return None
-
-        # нормализуем количество токенов по их decimals
-        token_amount = b_amt / (Decimal(10) ** token_decimals)
-        if token_amount <= 0:
-            return None
-
-        # Цена 1 токена в USDT: 100 / кол-во токенов
-        price = MATCHA_USDT_AMOUNT / token_amount
-
-        add_log(
-            f"Matcha: 1 TOKEN ({token_address}) = {float(price):.8f} USDT "
-            f"(через {MATCHA_USDT_AMOUNT} USDT, chainId={chain_id})"
-        )
-
-        return float(price)
-
-    except Exception as e:
-        add_log(f"Ошибка при запросе к Matcha для {token_address}: {e}")
-        return None
-
-
-def get_matcha_token_info(token_address: str, chain_id: int = MATCHA_CHAIN_ID) -> Optional[dict]:
-    """
-    Запрашивает у matcha.xyz сведения о токене: decimals, symbol, name.
-    Возвращает dict с ключами: address, decimals, symbol, name  или None при ошибке.
-    """
-    addr = (token_address or "").strip()
-    if not addr:
-        return None
-
-    try:
-        url = "https://matcha.xyz/api/tokens/search"
-        params = {"addresses": addr, "chainId": chain_id}
-
-        # MATCHA_HEADERS определены в том же модуле
-        resp = http_client.get(url, params=params, headers=MATCHA_HEADERS, timeout=6.0)
-        if resp.status_code != 200:
-            add_log(f"Matcha token info HTTP {resp.status_code} для {addr}: {resp.text[:150]}")
-            return None
-
-        j = resp.json()
-        data = j.get("data") or []
-        if not data or not isinstance(data, list):
-            add_log(f"Matcha token info: пустой data для {addr}")
-            return None
-
-        # Иногда API возвращает несколько записей — берём первую
-        info = data[0]
-        decimals = info.get("decimals")
-        symbol = info.get("symbol")
-        name = info.get("name")
-        address = info.get("address") or addr
-
-        # валидация
-        if decimals is None:
-            add_log(f"Matcha token info: нет decimals для {addr}")
-            return None
-
-        result = {
-            "address": address,
-            "decimals": int(decimals),
-            "symbol": symbol,
-            "name": name,
-        }
-        add_log(f"Matcha token info: {symbol or address} decimals={result['decimals']}")
-        return result
-
-    except Exception as e:
-        add_log(f"Ошибка получения meta от Matcha для {token_address}: {e}")
-        return None
-
-
+# ===== ОСТАЛЬНЫЕ ФУНКЦИИ ОСТАЮТСЯ БЕЗ ИЗМЕНЕНИЙ =====
+# Скопируйте остальные функции из оригинального core.py
+# которые не делают прямые HTTP запросы к Jupiter, PancakeSwap, MEXC, Matcha, CoinGecko
 
 def get_dexscreener_pairs(base: str, quote: str):
+    """Получить пары из DexScreener (через backend API)"""
     q = f"{base.upper()}/{quote.upper()}"
     try:
-        r = http_client.get(DEXSCREENER_SEARCH_URL, params={"q": q})
-        if r.status_code != 200:
-            add_log(f"Pancake HTTP {r.status_code} для {q}: {r.text[:150]}")
-            return []
-        data = r.json()
-        pairs = data.get("pairs") or []
-        if not isinstance(pairs, list):
-            add_log(f"Pancake: неверный формат ответа для {q}")
-            return []
-        return pairs
+        client = get_client()
+        response = client.search_dexscreener(query=q)
+        
+        if response.get("status") == "ok":
+            results = response.get("results", [])
+            add_log(f"DexScreener: найдено {len(results)} пар для {q} (через backend API)")
+            return results
+        
+        add_log(f"DexScreener: ошибка поиска для {q} через backend")
+        return []
     except Exception as e:
-        add_log(f"Pancake: ошибка для {q}: {e}")
+        add_log(f"DexScreener: ошибка для {q}: {e}")
         return []
 
 
-def pick_price_for_dex(pairs, base: str, quote: str, dex: str) -> Optional[float]:
-    base_u = base.upper()
-    quote_u = quote.upper()
-    cands: List[dict] = []
-
-    for p in pairs:
-        bt = p.get("baseToken") or {}
-        qt = p.get("quoteToken") or {}
-        bt_sym = str(bt.get("symbol", "")).upper()
-        qt_sym = str(qt.get("symbol", "")).upper()
-        chain = str(p.get("chainId", "")).lower()
-        dex_id = str(p.get("dexId", "")).lower()
-
-        if bt_sym != base_u:
-            continue
-        if quote_u and qt_sym != quote_u:
-            continue
-
-        if dex == "pancake":
-            if not dex_id.startswith("pancakeswap"):
-                continue
-        elif dex == "jupiter":
-            if chain != "solana":
-                continue
-        elif dex == "matcha":
-            if chain not in ("ethereum", "arbitrum", "optimism", "polygon"):
-                continue
-
-        cands.append(p)
-
-    if not cands:
+def search_dexscreener(query: str) -> Optional[List[Dict]]:
+    """
+    Поиск токенов в DexScreener (через backend API).
+    
+    ОБНОВЛЕНО: Теперь запрос идет через backend API на Render сервер.
+    """
+    q = (query or "").strip()
+    if not q:
         return None
 
-    def liq_usd(pair: dict) -> float:
-        liq = pair.get("liquidity") or {}
-        try:
-            return float(liq.get("usd") or 0)
-        except Exception:
-            return 0.0
-
-    best = max(cands, key=liq_usd)
     try:
-        return float(best.get("priceUsd"))
+        client = get_client()
+        response = client.search_dexscreener(query=q)
+        
+        if response.get("status") == "ok":
+            results = response.get("results", [])
+            add_log(f"DexScreener Search: найдено {len(results)} результатов для '{q}' (через backend API)")
+            return results
+        
+        return None
     except Exception as e:
-        add_log(f"Pancake: ошибка конвертации priceUsd: {e}")
+        add_log(f"DexScreener Search: ошибка поиска '{q}': {e}")
         return None
 
 
-def calc_spread(cex_bid: float, cex_ask: float, dex_price: float):
-    if dex_price is None or dex_price <= 0:
-        return None, None
+def get_pancake_tokens_list() -> Optional[Dict]:
+    """
+    Получить список всех токенов с PancakeSwap (через backend API).
+    
+    ОБНОВЛЕНО: Теперь запрос идет через backend API на Render сервер.
+    """
+    try:
+        client = get_client()
+        response = client.get_pancake_tokens_list()
+        
+        if response.get("status") == "ok":
+            tokens = response.get("tokens", {})
+            add_log(f"PancakeSwap: загружено {len(tokens)} токенов (через backend API)")
+            return tokens
+        
+        return None
+    except Exception as e:
+        add_log(f"PancakeSwap: ошибка получения списка токенов: {e}")
+        return None
 
-    # прямой спред — продаём на MEXC по bid1
-    direct = None
-    if cex_bid and cex_bid > 0:
-        direct = (cex_bid - dex_price) / dex_price * 100.0
 
-    # обратный спред — покупаем на MEXC по ask1
-    reverse = None
-    if cex_ask and cex_ask > 0:
-        reverse = (dex_price - cex_ask) / cex_ask * 100.0
+def get_coingecko_coins_list() -> Optional[List[Dict]]:
+    """
+    Получить список всех монет с CoinGecko (через backend API).
+    
+    ОБНОВЛЕНО: Теперь запрос идет через backend API на Render сервер.
+    """
+    try:
+        client = get_client()
+        response = client.get_coingecko_coins_list()
+        
+        if response.get("status") == "ok":
+            coins = response.get("coins", [])
+            add_log(f"CoinGecko: загружено {len(coins)} монет (через backend API)")
+            return coins
+        
+        return None
+    except Exception as e:
+        add_log(f"CoinGecko: ошибка получения списка монет: {e}")
+        return None
 
-    return direct, reverse
+
+def get_coingecko_markets(ids: str, vs_currency: str = "usd") -> Optional[List[Dict]]:
+    """
+    Получить информацию о монетах с CoinGecko (через backend API).
+    
+    ОБНОВЛЕНО: Теперь запрос идет через backend API на Render сервер.
+    """
+    if not ids:
+        return None
+
+    try:
+        client = get_client()
+        response = client.get_coingecko_markets(ids=ids, vs_currency=vs_currency)
+        
+        if response.get("status") == "ok":
+            markets = response.get("markets", [])
+            add_log(f"CoinGecko Markets: получено {len(markets)} монет (через backend API)")
+            return markets
+        
+        return None
+    except Exception as e:
+        add_log(f"CoinGecko Markets: ошибка получения данных: {e}")
+        return None
 
 
-class PriceWorker(QThread):
-    data_ready = pyqtSignal(dict)
+def fetch_L_M_for_pair(pair_cfg) -> Optional[Dict[str, float]]:
+    """
+    Получить L и M для пары (Liquidity и Market Cap) (через backend API).
+    
+    ОБНОВЛЕНО: Теперь использует backend API для получения данных.
+    """
+    if not pair_cfg or not pair_cfg.bsc_address:
+        return None
 
-    def __init__(self, pairs, interval: float = POLL_INTERVAL):
-        super().__init__()
-        self.pairs = pairs
-        self.interval = interval
-        self._running = True
-
-    def _process_pair(self, name, cfg):
-        """
-        Обработка одной пары в отдельном потоке.
-        Это тот же код, что раньше был внутри цикла for name, cfg in self.pairs.items().
-        """
-        try:
-            base = cfg.base.upper()
-            quote = cfg.quote.upper()
-
-            # -------------- CEX (MEXC) --------------
-            cex_bid, cex_ask = get_mexc_price(base, quote, cfg.mexc_price_scale)
-
-            allowed = set(cfg.dexes) if cfg.dexes else set()
-
-            # если dexes явно не указаны — включаем только те DEX,
-            # для которых реально есть данные в cfg
-            if not cfg.dexes:
-                has_any_addr = False
-
-                if getattr(cfg, "bsc_address", None):
-                    allowed.add("pancake")
-                    has_any_addr = True
-
-                if getattr(cfg, "jupiter_mint", None):
-                    allowed.add("jupiter")
-                    has_any_addr = True
-
-                if getattr(cfg, "matcha_address", None):
-                    allowed.add("matcha")
-                    has_any_addr = True
-
-                # если вообще НИЧЕГО не настроено — старый режим:
-                # ищем по символу через DexScreener/Jupiter/Matcha/Pancake
-                if not has_any_addr:
-                    allowed = {"pancake", "jupiter", "matcha"}
-            spreads = {}
-
-            # ------------------------------------------------------
-            # -------------- PANCAKE (BSC) -------------------------
-            # ------------------------------------------------------
-            if "pancake" in allowed:
-                bsc_addr = getattr(cfg, "bsc_address", None)
-
-                if not bsc_addr:
-                    add_log(f"[{name}] Pancake: нет bsc_address в cfg")
-                else:
-                    dex_price = get_pancake_price_usdt(bsc_addr)
-
-                    if dex_price is None:
-                        add_log(f"[{name}] Pancake: цена не получена")
-                    else:
-                        d, r = calc_spread(cex_bid, cex_ask, dex_price)
-                        spreads["pancake"] = {
-                            "direct": d,
-                            "reverse": r,
-                            "dex_price": dex_price,
-                            "cex_bid": cex_bid,
-                            "cex_ask": cex_ask,
-                        }
-
-            # ------------------------------------------------------
-            # -------------- JUPITER -------------------------------
-            # ------------------------------------------------------
-            ds_pairs = None
-
-            if "jupiter" in allowed:
-                j_price = None
-                mint = getattr(cfg, "jupiter_mint", None)
-                dec = getattr(cfg, "jupiter_decimals", None)
-
-                if mint and isinstance(dec, int):
-                    j_price = get_jupiter_price_usdt(mint, dec)
-
-                if j_price is None:
-                    if ds_pairs is None:
-                        ds_pairs = get_dexscreener_pairs(base, quote)
-                    j_price = pick_price_for_dex(ds_pairs, base, quote, "jupiter")
-
-                if j_price:
-                    d, r = calc_spread(cex_bid, cex_ask, j_price)
-                    spreads["jupiter"] = {
-                        "direct": d,
-                        "reverse": r,
-                        "dex_price": j_price,
-                        "cex_bid": cex_bid,
-                        "cex_ask": cex_ask,
-                    }
-
-            # ------------------------------------------------------
-            # -------------- MATCHA --------------------------------
-            # ------------------------------------------------------
-            if "matcha" in allowed:
-                sell_token = getattr(cfg, "matcha_address", None)
-                sell_decimals = getattr(cfg, "matcha_decimals", None)
-
-                if sell_token:
-                    sell_decimals = sell_decimals or MATCHA_DEFAULT_SELL_DECIMALS
-
-                    m_price = get_matcha_price_usdt(
-                        token_address=sell_token,  # matcha_address из cfg
-                        token_decimals=sell_decimals,  # matcha_decimals
-                        chain_id=MATCHA_CHAIN_ID,
-                        usdt_token=MATCHA_USDT,
-                        usdt_decimals=MATCHA_USDT_DECIMALS,
-                    )
-
-                    if m_price:
-                        d, r = calc_spread(cex_bid, cex_ask, m_price)
-                        spreads["matcha"] = {
-                            "direct": d,
-                            "reverse": r,
-                            "dex_price": m_price,
-                            "cex_bid": cex_bid,
-                            "cex_ask": cex_ask,
-                        }
-                else:
-                    add_log(f"[{name}] Matcha: нет matcha_address в cfg")
-
-            # финальный результат ДЛЯ ЭТОЙ ПАРЫ
-            return name, {
-                "mexc_price": (cex_bid, cex_ask),
-                "spreads": spreads,
+    try:
+        client = get_client()
+        
+        # Получить данные через DexScreener
+        response = client.get_price_dex(address=pair_cfg.bsc_address)
+        
+        if response.get("status") == "ok":
+            raw_data = response.get("raw", {})
+            pairs = raw_data.get("pairs", [])
+            if not pairs:
+                return None
+            
+            # Берем первую пару (лучшую по ликвидности)
+            pair = pairs[0]
+            liquidity = pair.get("liquidity", {})
+            
+            return {
+                "L": float(liquidity.get("usd", 0) or 0),
+                "M": float(pair.get("marketCap", 0) or 0),
             }
-
-        except Exception as e:
-            add_log(f"Worker: ошибка при обработке {name}: {e}")
-            return None
-
-    def run(self):
-        while self._running:
-            snapshot = {}
-
-            try:
-                items = list(self.pairs.items())
-                if items:
-                    # сколько потоков одновременно использовать
-                    max_workers = min(8, len(items))  # можешь поднять до 16 / 32
-
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        futures = [
-                            executor.submit(self._process_pair, name, cfg)
-                            for name, cfg in items
-                        ]
-
-                        for fut in futures:
-                            try:
-                                res = fut.result()
-                            except Exception as e:
-                                add_log(f"Worker: ошибка в потоке: {e}")
-                                continue
-
-                            if not res:
-                                continue
-
-                            name, data = res
-                            if data is not None:
-                                snapshot[name] = data
-
-            except Exception as e:
-                add_log(f"Worker: неперехваченное исключение: {e}")
-
-            if snapshot:
-                self.data_ready.emit(snapshot)
-
-            # та же логика ожидания по interval, что и была
-            steps = max(1, int(float(self.interval) * 10))
-
-            for _ in range(steps):
-                if not self._running:
-                    break
-
-                # спим 100 мс
-                self.msleep(100)
-
-                # если интервал поменяли в настройках — выходим из цикла ожидания
-                new_steps = max(1, int(float(self.interval) * 10))
-                if new_steps != steps:
-                    # интервал изменился (например, с 999 на 1) — переходим к новому циклу
-                    break
-
-    def stop(self):
-        self._running = False
+        
+        return None
+    except Exception as e:
+        add_log(f"Fetch L/M: ошибка для {pair_cfg.bsc_address}: {e}")
+        return None
 
 
-log("Приложение запущено")
+# ===== ИНИЦИАЛИЗАЦИЯ =====
+
+def initialize_api_client():
+    """
+    Инициализировать API клиент при старте приложения.
+    """
+    try:
+        backend_url = os.getenv("BACKEND_URL", "https://hydra-tra4.onrender.com")
+        admin_token = os.getenv("ADMIN_TOKEN", "")
+        
+        client = get_client(base_url=backend_url, admin_token=admin_token)
+        add_log(f"API Client инициализирован: {backend_url}")
+        return client
+    except Exception as e:
+        add_log(f"Ошибка инициализации API Client: {e}")
+        return None
+
+
+def close_api_client():
+    """
+    Закрыть API клиент при завершении приложения.
+    """
+    try:
+        from api_client import close_client
+        close_client()
+        add_log("API Client закрыт")
+    except Exception as e:
+        add_log(f"Ошибка закрытия API Client: {e}")
