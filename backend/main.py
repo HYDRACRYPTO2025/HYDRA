@@ -1,6 +1,7 @@
-# backend/main.py
+# backend/main_extended.py
+# Расширенный backend с дополнительными endpoints для работы с внешними API
 import os
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from decimal import Decimal
 
 import httpx
@@ -21,25 +22,31 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 if not ADMIN_TOKEN:
     raise RuntimeError("ADMIN_TOKEN is not set")
 
+# External API URLs
 DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens"
+DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
 DEXSCREENER_TIMEOUT = 10.0
 
-# MEXC (spot) depth endpoint
 MEXC_DEPTH_URL = "https://api.mexc.com/api/v3/depth"
+MEXC_FUTURES_BASE = "https://contract.mexc.com"
+MEXC_FUTURES_TICKER = "https://contract.mexc.com/api/v1/contract/ticker"
 
-# Jupiter price config
 JUPITER_QUOTE_URL = "https://ultra-api.jup.ag/order"
+JUPITER_LITE_API = "https://lite-api.jup.ag/tokens/v2/search"
 JUPITER_USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 JUPITER_USDT_DECIMALS = 6
 JUPITER_USDT_AMOUNT = Decimal("100")
 
-# Matcha price config
 MATCHA_PRICE_URL = "https://matcha.xyz/api/gasless/price"
+MATCHA_TOKENS_SEARCH = "https://matcha.xyz/api/tokens/search"
 MATCHA_USDT = "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"
 MATCHA_CHAIN_ID = 8453
 MATCHA_USDT_AMOUNT = Decimal("100")
 MATCHA_USDT_DECIMALS = 6
 MATCHA_DEFAULT_SELL_DECIMALS = 18
+
+PANCAKE_TOKENS_API = "https://api.pancakeswap.info/api/tokens"
+COINGECKO_API = "https://api.coingecko.com/api/v3"
 
 MATCHA_HEADERS = {
     "User-Agent": (
@@ -56,7 +63,6 @@ MATCHA_HEADERS = {
 
 # ==== DB UTILS ====
 
-
 def get_db():
     db = SessionLocal()
     try:
@@ -70,8 +76,7 @@ def require_admin(x_admin_token: str = Header(...)) -> None:
         raise HTTPException(status_code=401, detail="invalid_admin_token")
 
 
-# ==== Pydantic-схемы ====
-
+# ==== Pydantic Models ====
 
 class TokenCreate(BaseModel):
     chain: str
@@ -92,27 +97,41 @@ class TokenOut(BaseModel):
         orm_mode = True
 
 
-# ==== LIFECYCLE ====
+class PriceResponse(BaseModel):
+    status: str
+    price: float
+    source: str
 
+
+class SearchResponse(BaseModel):
+    status: str
+    results: List[Dict[str, Any]]
+
+
+# ==== LIFECYCLE ====
 
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
 
 
-# ==== ТЕСТОВЫЕ ЭНДПОИНТЫ ====
-
+# ==== HEALTH CHECK ====
 
 @app.get("/")
 def read_root():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "2.0"}
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
 
 
 @app.get("/cg_ping")
 def cg_ping():
     try:
-        r = httpx.get("https://api.coingecko.com/api/v3/ping", timeout=10.0)
-        return {"status": "ok", "coingecko_raw": r.json()}
+        r = httpx.get(f"{COINGECKO_API}/ping", timeout=10.0)
+        return {"status": "ok", "coingecko": r.json()}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"coingecko_error: {e}")
 
@@ -127,8 +146,7 @@ def db_ping():
         raise HTTPException(status_code=500, detail=f"db_error: {e}")
 
 
-# ==== ПУБЛИЧНАЯ ЧАСТЬ ДЛЯ КЛИЕНТОВ ====
-
+# ==== TOKEN MANAGEMENT ====
 
 @app.post("/tokens", response_model=TokenOut)
 def client_add_token(token: TokenCreate, db: Session = Depends(get_db)):
@@ -169,9 +187,6 @@ def client_list_tokens(
 
     tokens = q.order_by(models.Token.created_at.desc()).all()
     return tokens
-
-
-# ==== АДМИНКА: РАБОТА С ТОКЕНАМИ ====
 
 
 @app.post("/admin/tokens", response_model=TokenOut)
@@ -243,13 +258,13 @@ def admin_delete_token(
     return {"status": "ok", "token_id": token_id}
 
 
-# ==== PRICE: DexScreener (Pancake и др.) ====
-
+# ==== PRICE ENDPOINTS ====
 
 @app.get("/price/dex_by_address")
 def price_dex_by_address(
-    address: str = Query(..., description="Token address (chain-specific)"),
+    address: str = Query(..., description="Token address"),
 ):
+    """Получить цену токена через DexScreener"""
     addr = address.strip()
     if not addr:
         raise HTTPException(status_code=400, detail="empty_address")
@@ -264,7 +279,7 @@ def price_dex_by_address(
     if resp.status_code != 200:
         raise HTTPException(
             status_code=resp.status_code,
-            detail=f"dexscreener_http_{resp.status_code}: {resp.text[:200]}",
+            detail=f"dexscreener_http_{resp.status_code}",
         )
 
     data = resp.json()
@@ -276,13 +291,55 @@ def price_dex_by_address(
     }
 
 
-# ==== PRICE: MEXC spot ====
+@app.get("/price/pancake")
+def price_pancake(
+    address: str = Query(..., description="Token address on BSC"),
+):
+    """Получить цену токена на PancakeSwap"""
+    addr = address.strip()
+    if not addr:
+        raise HTTPException(status_code=400, detail="empty_address")
+
+    url = f"{DEXSCREENER_TOKENS_URL}/{addr}"
+
+    try:
+        resp = httpx.get(url, timeout=DEXSCREENER_TIMEOUT)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"pancake_request_error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="pancake_api_error")
+
+    data = resp.json()
+    pairs = data.get("pairs") or []
+    
+    if not pairs:
+        raise HTTPException(status_code=404, detail="no_pairs_found")
+
+    # Ищем PancakeSwap пулы
+    pancake_pairs = [p for p in pairs if "pancake" in str(p.get("dexId", "")).lower()]
+    
+    if pancake_pairs:
+        best_pair = max(pancake_pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+    else:
+        best_pair = pairs[0]
+
+    price = float(best_pair.get("priceUsd", 0))
+    
+    return {
+        "status": "ok",
+        "source": "pancake",
+        "address": addr,
+        "price": price,
+        "pair": best_pair,
+    }
 
 
-@app.get("/cex/mexc_price")
-def mexc_price(
+@app.get("/price/mexc")
+def price_mexc(
     symbol: str = Query(..., description="Trading pair, e.g. GOAT_USDT"),
 ):
+    """Получить цену на MEXC"""
     s = symbol.strip().upper()
     if not s:
         raise HTTPException(status_code=400, detail="empty_symbol")
@@ -294,10 +351,7 @@ def mexc_price(
         raise HTTPException(status_code=502, detail=f"mexc_request_error: {e}")
 
     if resp.status_code != 200:
-        raise HTTPException(
-            status_code=resp.status_code,
-            detail=f"mexc_http_{resp.status_code}: {resp.text[:200]}",
-        )
+        raise HTTPException(status_code=resp.status_code, detail="mexc_api_error")
 
     data = resp.json()
     bids = data.get("bids") or []
@@ -317,7 +371,6 @@ def mexc_price(
     if bid is None or ask is None:
         raise HTTPException(status_code=502, detail="no_orderbook")
 
-    # оценим количество знаков после запятой
     price_str = str(bid)
     if "." in price_str:
         price_scale = len(price_str.split(".")[1])
@@ -329,11 +382,9 @@ def mexc_price(
         "symbol": s,
         "bid": bid,
         "ask": ask,
+        "price": (bid + ask) / 2,
         "price_scale": price_scale,
     }
-
-
-# ==== PRICE: Matcha (0x) через наш бекенд ====
 
 
 @app.get("/price/matcha_by_address")
@@ -344,11 +395,11 @@ def price_matcha_by_address(
     usdt_token: str = Query(MATCHA_USDT),
     usdt_decimals: int = Query(MATCHA_USDT_DECIMALS, ge=0),
 ):
+    """Получить цену токена через Matcha (0x)"""
     addr = address.strip()
     if not addr:
         raise HTTPException(status_code=400, detail="empty_address")
 
-    # 100 USDT в raw
     try:
         sell_amount_raw = int(
             MATCHA_USDT_AMOUNT * (Decimal(10) ** int(usdt_decimals))
@@ -373,16 +424,13 @@ def price_matcha_by_address(
         raise HTTPException(status_code=502, detail=f"matcha_request_error: {e}")
 
     if resp.status_code != 200:
-        raise HTTPException(
-            status_code=resp.status_code,
-            detail=f"matcha_http_{resp.status_code}: {resp.text[:200]}",
-        )
+        raise HTTPException(status_code=resp.status_code, detail="matcha_api_error")
 
     data = resp.json()
     s_raw = data.get("sellAmount")
     b_raw = data.get("buyAmount")
     if not s_raw or not b_raw:
-        raise HTTPException(status_code=502, detail=f"no_sell_or_buy_amount: {data}")
+        raise HTTPException(status_code=502, detail="no_amounts_in_response")
 
     try:
         s_amt = Decimal(str(s_raw))
@@ -403,11 +451,8 @@ def price_matcha_by_address(
         "status": "ok",
         "price": float(price),
         "usdt_amount": float(MATCHA_USDT_AMOUNT),
-        "raw": data,
+        "source": "matcha",
     }
-
-
-# ==== PRICE: Jupiter (по mint) ====
 
 
 @app.get("/price/jupiter")
@@ -415,6 +460,7 @@ def price_jupiter(
     mint: str = Query(..., description="Token mint"),
     decimals: int = Query(..., ge=0, description="Token decimals"),
 ):
+    """Получить цену токена через Jupiter"""
     m = mint.strip()
     if not m:
         raise HTTPException(status_code=400, detail="empty_mint")
@@ -441,23 +487,17 @@ def price_jupiter(
         raise HTTPException(status_code=502, detail=f"jupiter_request_error: {e}")
 
     if resp.status_code != 200:
-        raise HTTPException(
-            status_code=resp.status_code,
-            detail=f"jupiter_http_{resp.status_code}: {resp.text[:200]}",
-        )
+        raise HTTPException(status_code=resp.status_code, detail="jupiter_api_error")
 
     data = resp.json()
     out_amount_str = data.get("outAmount")
     if not out_amount_str:
-        raise HTTPException(status_code=502, detail=f"no_outAmount: {data}")
+        raise HTTPException(status_code=502, detail="no_outAmount")
 
     try:
         out_amount_raw = int(out_amount_str)
     except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"bad_outAmount {out_amount_str}: {e}",
-        )
+        raise HTTPException(status_code=502, detail=f"bad_outAmount: {e}")
 
     if out_amount_raw <= 0:
         raise HTTPException(status_code=502, detail="non_positive_outAmount")
@@ -472,5 +512,210 @@ def price_jupiter(
         "status": "ok",
         "price": float(price),
         "usdt_amount": float(JUPITER_USDT_AMOUNT),
-        "out_amount_raw": out_amount_raw,
+        "source": "jupiter",
+    }
+
+
+# ==== SEARCH ENDPOINTS ====
+
+@app.get("/search/dexscreener")
+def search_dexscreener(
+    q: str = Query(..., description="Search query"),
+):
+    """Поиск токенов в DexScreener"""
+    query = q.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="empty_query")
+
+    try:
+        resp = httpx.get(
+            DEXSCREENER_SEARCH_URL,
+            params={"q": query},
+            timeout=DEXSCREENER_TIMEOUT,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"search_error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="search_api_error")
+
+    data = resp.json()
+    return {
+        "status": "ok",
+        "source": "dexscreener",
+        "query": query,
+        "results": data.get("pairs", []),
+    }
+
+
+@app.get("/search/jupiter")
+def search_jupiter(
+    q: str = Query(..., description="Search query"),
+):
+    """Поиск токенов в Jupiter"""
+    query = q.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="empty_query")
+
+    try:
+        resp = httpx.get(
+            JUPITER_LITE_API,
+            params={"search": query},
+            timeout=5.0,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"search_error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="search_api_error")
+
+    data = resp.json()
+    return {
+        "status": "ok",
+        "source": "jupiter",
+        "query": query,
+        "results": data if isinstance(data, list) else data.get("tokens", []),
+    }
+
+
+@app.get("/search/matcha")
+def search_matcha(
+    q: str = Query(..., description="Search query"),
+):
+    """Поиск токенов в Matcha"""
+    query = q.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="empty_query")
+
+    try:
+        resp = httpx.get(
+            MATCHA_TOKENS_SEARCH,
+            params={"query": query},
+            headers=MATCHA_HEADERS,
+            timeout=5.0,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"search_error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="search_api_error")
+
+    data = resp.json()
+    return {
+        "status": "ok",
+        "source": "matcha",
+        "query": query,
+        "results": data.get("tokens", []) if isinstance(data, dict) else data,
+    }
+
+
+# ==== MEXC FUTURES ====
+
+@app.get("/futures/mexc_ticker")
+def mexc_futures_ticker(
+    symbol: str = Query(..., description="Futures symbol, e.g. GOAT_USDT"),
+):
+    """Получить информацию о фьючерсе на MEXC"""
+    s = symbol.strip().upper()
+    if not s:
+        raise HTTPException(status_code=400, detail="empty_symbol")
+
+    try:
+        resp = httpx.get(
+            MEXC_FUTURES_TICKER,
+            params={"symbol": s},
+            timeout=5.0,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"mexc_futures_error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="mexc_futures_api_error")
+
+    data = resp.json()
+    return {
+        "status": "ok",
+        "source": "mexc_futures",
+        "symbol": s,
+        "data": data,
+    }
+
+
+# ==== PANCAKE ====
+
+@app.get("/tokens/pancake_list")
+def pancake_tokens_list():
+    """Получить список всех токенов с PancakeSwap"""
+    try:
+        resp = httpx.get(PANCAKE_TOKENS_API, timeout=10.0)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"pancake_list_error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="pancake_api_error")
+
+    data = resp.json()
+    return {
+        "status": "ok",
+        "source": "pancake",
+        "tokens": data,
+    }
+
+
+# ==== COINGECKO ====
+
+@app.get("/coingecko/coins_list")
+def coingecko_coins_list():
+    """Получить список всех монет с CoinGecko"""
+    try:
+        resp = httpx.get(
+            f"{COINGECKO_API}/coins/list",
+            timeout=10.0,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"coingecko_error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="coingecko_api_error")
+
+    data = resp.json()
+    return {
+        "status": "ok",
+        "source": "coingecko",
+        "coins": data,
+    }
+
+
+@app.get("/coingecko/markets")
+def coingecko_markets(
+    ids: str = Query(..., description="Comma-separated coin IDs"),
+    vs_currency: str = Query("usd"),
+):
+    """Получить информацию о монетах с CoinGecko"""
+    if not ids:
+        raise HTTPException(status_code=400, detail="empty_ids")
+
+    try:
+        resp = httpx.get(
+            f"{COINGECKO_API}/coins/markets",
+            params={
+                "ids": ids,
+                "vs_currency": vs_currency,
+                "order": "market_cap_desc",
+                "per_page": 250,
+                "page": 1,
+            },
+            timeout=10.0,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"coingecko_error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="coingecko_api_error")
+
+    data = resp.json()
+    return {
+        "status": "ok",
+        "source": "coingecko",
+        "markets": data,
     }
