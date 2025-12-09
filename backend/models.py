@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, ForeignKey
 from sqlalchemy.sql import func
 
 from .db import Base
@@ -46,7 +46,60 @@ class Proxy(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     # Формат: socks5://user:pass@ip:port или http://ip:port
-    url = Column(String(256), unique=True, nullable=False)
-    is_active = Column(Boolean, default=True)
+    url = Column(String(256 ), unique=True, nullable=False)
+    protocol = Column(String(16), nullable=False, default="socks5")  # http, https, socks5
+    is_active = Column(Boolean, default=True )
     note = Column(String(128), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AccessToken(Base):
+    """
+    Таблица токенов доступа для десктоп-приложений.
+    Каждый токен дает доступ к API.
+    """
+    __tablename__ = "access_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String(256), unique=True, nullable=False, index=True)
+    name = Column(String(128), nullable=True)  # описание токена
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class AdminUser(Base):
+    """
+    Таблица администраторов для админ-панели.
+    """
+    __tablename__ = "admin_users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(64), unique=True, nullable=False, index=True)
+    password_hash = Column(String(256), nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PriceHistory(Base):
+    """
+    Таблица истории цен для каждой пары токенов.
+    Сохраняет исторические данные цен, чтобы показывать графики.
+    Данные сохраняются при каждом запросе цены из приложения.
+    """
+    __tablename__ = "price_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    token_id = Column(Integer, nullable=False, index=True)  # ссылка на tokens.id
+    
+    # Цены с разных источников
+    mexc_bid = Column(Float, nullable=True)
+    mexc_ask = Column(Float, nullable=True)
+    matcha_price = Column(Float, nullable=True)
+    pancake_price = Column(Float, nullable=True)
+    
+    # Дополнительные данные
+    spread = Column(Float, nullable=True)  # спред между bid и ask
+    
+    # Время создания записи
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
