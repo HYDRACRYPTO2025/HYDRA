@@ -1,235 +1,189 @@
-from dataclasses import dataclass
-from typing import Optional, Dict
-
-from datetime import datetime
-
 import cloudscraper
+import httpx
+from datetime import datetime
+from typing import Optional, Tuple
+from sqlalchemy.orm import Session
+
+from .logic import log
+from .proxy_manager import ProxyManager
 
 
-def log(msg: str) -> None:
-    """Простой лог — увидишь его в LOGS на Render."""
-    ts = datetime.utcnow().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
-
-
-# === HTTP клиент с cloudscraper, как в core.py ===
-
-http_client = cloudscraper.create_scraper(
-    browser={
-        "browser": "chrome",
-        "platform": "windows",
-        "mobile": False,
+def get_http_client_with_proxy(proxy_dict: dict ):
+    """
+    Создать cloudscraper клиент с прокси.
+    proxy_dict должен быть в формате:
+    {
+        "http://": "socks5://user:pass@ip:port",
+        "https://": "socks5://user:pass@ip:port"
     }
-)
-
-# === Dataclass для конфигурации L/M ===
-
-
-@dataclass
-class PairConfigLM:
-    base: str
-    cg_id: Optional[str] = None
-
-
-# === Работа с CoinGecko (кэш списка монет) ===
-
-_CG_COINS_LIST = []
-_CG_LIST_LOADED = False
-_CG_SYMBOL_INDEX: Dict[str, str] = {}
+    """
+    http_client = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+     )
+    
+    if proxy_dict:
+        http_client.proxies = proxy_dict
+    
+    return http_client
 
 
-def _ensure_cg_coins_list() -> None:
-    """Один раз за запуск грузим полный список CoinGecko."""
-    global _CG_COINS_LIST, _CG_LIST_LOADED
-
-    if _CG_LIST_LOADED:
-        return
-
-    try:
-        resp = http_client.get(
-            "https://api.coingecko.com/api/v3/coins/list",
-            timeout=20.0,
-        )
-        if resp.status_code != 200:
-            log(f"CoinGecko list: HTTP {resp.status_code}: {str(resp.text)[:150]}")
-            _CG_COINS_LIST = []
-            _CG_LIST_LOADED = True
-            return
-
-        data = resp.json()
-        if isinstance(data, list):
-            _CG_COINS_LIST = data
-        else:
-            _CG_COINS_LIST = []
-        _CG_LIST_LOADED = True
-        log(f"CoinGecko list: loaded {len(_CG_COINS_LIST)} coins")
-    except Exception as e:
-        log(f"CoinGecko list: error: {e}")
-        _CG_COINS_LIST = []
-        _CG_LIST_LOADED = True
-
-
-def _pick_coingecko_id_for_symbol(symbol: str) -> Optional[str]:
-    """Подбор id по символу — логика похожа на твою в core.py."""
-    global _CG_SYMBOL_INDEX
-
-    symbol = (symbol or "").strip().upper()
-    if not symbol:
-        return None
-
-    if symbol in _CG_SYMBOL_INDEX:
-        return _CG_SYMBOL_INDEX[symbol]
-
-    _ensure_cg_coins_list()
-    if not _CG_COINS_LIST:
-        return None
-
-    sym_lower = symbol.lower()
-    best_id: Optional[str] = None
-    best_score: Optional[float] = None
-
-    bad_words = (
-        "wrapped", "bridge", "bridged", "staked",
-        "wormhole", "peg", "binance", "binance-peg",
-        "weth", "leveraged", "bull", "bear",
-    )
-
-    for item in _CG_COINS_LIST:
-        try:
-            sym = str(item.get("symbol") or "").upper()
-            if sym != symbol:
-                continue
-
-            cid = str(item.get("id") or "")
-            name = str(item.get("name") or "")
-            cid_l = cid.lower()
-            name_l = name.lower()
-
-            score = 0.0
-
-            if cid_l == sym_lower:
-                score += 100.0
-
-            if name_l == sym_lower:
-                score += 50.0
-
-            if name_l.startswith(sym_lower):
-                score += 25.0
-
-            if "-" not in cid and " " not in cid:
-                score += 10.0
-
-            if any(w in cid_l for w in bad_words) or any(
-                w in name_l for w in bad_words
-            ):
-                score -= 30.0
-
-            score -= len(cid) * 0.01
-
-            if best_score is None or score > best_score:
-                best_score = score
-                best_id = cid
-        except Exception:
-            continue
-
-    if best_id:
-        _CG_SYMBOL_INDEX[symbol] = best_id
-        log(f"CoinGecko: {symbol} -> id={best_id}")
+async def get_httpx_client_with_proxy(proxy_dict: dict ):
+    """
+    Создать httpx AsyncClient с прокси.
+    """
+    if proxy_dict:
+        # Берем первый прокси из словаря (они одинаковые для http и https )
+        proxy_url = list(proxy_dict.values())[0] if proxy_dict else None
+        return httpx.AsyncClient(proxies=proxy_url, timeout=10 )
     else:
-        log(f"CoinGecko: no id for symbol {symbol}")
-
-    return best_id
+        return httpx.AsyncClient(timeout=10 )
 
 
-def fetch_L_M_for_pair(pair_cfg: PairConfigLM) -> Optional[Dict[str, float]]:
+# --- MEXC ---
+def get_mexc_price(
+    base: str,
+    quote: str = "USDT",
+    price_scale: int = 0,
+    db: Optional[Session] = None
+) -> Tuple[Optional[float], Optional[float]]:
     """
-    Аналог твоей функции fetch_L_M_for_pair:
-    - берём цену и amount24 с MEXC futures (BASE_USDT),
-    - берём капитализацию M с CoinGecko.
-
-    Возвращаем dict:
-      {
-        "price_mexc": float | None,
-        "L": float | None,
-        "M": float | None,
-        "cg_id": str | None
-      }
+    Получить цену с MEXC через прокси.
+    
+    Args:
+        base: Базовая монета (SOL, BTC и т.д.)
+        quote: Котируемая монета (USDT по умолчанию)
+        price_scale: Количество знаков после запятой
+        db: Сессия БД для получения прокси
+    
+    Returns:
+        (bid_price, ask_price) или (None, None) при ошибке
     """
-    base = (getattr(pair_cfg, "base", "") or "").upper().strip()
-    if not base:
-        return None
-
-    price_mexc: Optional[float] = None
-    L: Optional[float] = None
-    M: Optional[float] = None
-
-    # ------ MEXC futures: тикер BASE_USDT ------
-    symbol_fut = f"{base}_USDT"
+    symbol = f"{base.upper()}_{quote.upper()}"
+    
     try:
+        # Получаем прокси из БД
+        proxy_dict = {}
+        if db:
+            proxy_manager = ProxyManager(db)
+            proxy_url = proxy_manager.get_random_proxy()
+            if proxy_url:
+                proxy_dict = proxy_manager.get_proxy_dict(proxy_url)
+                proxy_manager.log_proxy_usage(proxy_url)
+        
+        # Создаем клиент с прокси
+        http_client = get_http_client_with_proxy(proxy_dict )
+        
         r = http_client.get(
-            "https://contract.mexc.com/api/v1/contract/ticker",
-            params={"symbol": symbol_fut},
-            timeout=10.0,
-        )
+            "https://api.mexc.com/api/v3/ticker/bookTicker",
+            params={"symbol": symbol},
+            timeout=10,
+         )
+        
         if r.status_code != 200:
-            log(
-                f"MEXC L/M futures: HTTP {r.status_code} for {symbol_fut}: "
-                f"{str(r.text)[:200]}"
-            )
-        else:
-            data = r.json()
-            if data.get("success"):
-                t = data.get("data") or {}
-                try:
-                    price_mexc = float(t.get("lastPrice") or 0.0)
-                except Exception:
-                    price_mexc = None
-                try:
-                    L = float(t.get("amount24") or 0.0)
-                except Exception:
-                    L = None
-            else:
-                log(
-                    f"MEXC L/M futures: code={data.get('code')} "
-                    f"msg={data.get('message')} for {symbol_fut}"
-                )
+            log(f"MEXC HTTP {r.status_code}: {r.text[:200]}")
+            return None, None
+
+        j = r.json()
+        bid = float(j.get("bidPrice", 0))
+        ask = float(j.get("askPrice", 0))
+
+        if price_scale:
+            bid = round(bid, price_scale)
+            ask = round(ask, price_scale)
+
+        return bid, ask
+
     except Exception as e:
-        log(f"MEXC L/M futures: error for {symbol_fut}: {e}")
+        log(f"MEXC error: {e}")
+        return None, None
 
-    # ------ CoinGecko: капитализация M ------
-    cg_id = getattr(pair_cfg, "cg_id", None)
-    if not cg_id:
-        cg_id = _pick_coingecko_id_for_symbol(base) or base.lower()
 
-    if cg_id:
-        try:
-            r = http_client.get(
-                "https://api.coingecko.com/api/v3/coins/markets",
-                params={"vs_currency": "usd", "ids": cg_id},
-                timeout=10.0,
-            )
-            if r.status_code != 200:
-                log(
-                    f"CoinGecko M: HTTP {r.status_code} for {cg_id}: "
-                    f"{str(r.text)[:150]}"
-                )
-            else:
-                data = r.json()
-                if isinstance(data, list) and data:
-                    item = data[0]
-                    try:
-                        M = float(item.get("market_cap") or 0.0)
-                    except Exception:
-                        M = None
-        except Exception as e:
-            log(f"CoinGecko M: error for {cg_id}: {e}")
-
-    if price_mexc is None and L is None and M is None:
+# --- Matcha (0x) ---
+def get_matcha_price_usdt(
+    addr: str,
+    decimals: int,
+    db: Optional[Session] = None
+) -> Optional[float]:
+    """
+    Получить цену с Matcha (0x) через прокси.
+    
+    Args:
+        addr: Адрес токена
+        decimals: Количество знаков после запятой
+        db: Сессия БД для получения прокси
+    
+    Returns:
+        Цена в USDT или None при ошибке
+    """
+    url = f"https://api.0x.org/swap/v1/price?sellToken={addr}&buyToken=USDT&sellAmount={10**decimals}"
+    
+    try:
+        # Получаем прокси из БД
+        proxy_dict = {}
+        if db:
+            proxy_manager = ProxyManager(db )
+            proxy_url = proxy_manager.get_random_proxy()
+            if proxy_url:
+                proxy_dict = proxy_manager.get_proxy_dict(proxy_url)
+                proxy_manager.log_proxy_usage(proxy_url)
+        
+        # Создаем клиент с прокси
+        http_client = get_http_client_with_proxy(proxy_dict )
+        
+        r = http_client.get(url, timeout=10 )
+        
+        if r.status_code != 200:
+            log(f"Matcha HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        
+        return float(r.json().get("price", 0))
+    
+    except Exception as e:
+        log(f"Matcha error: {e}")
         return None
 
-    return {
-        "price_mexc": price_mexc,
-        "L": L,
-        "M": M,
-        "cg_id": cg_id,
-    }
+
+# --- PancakeSwap (BSC) ---
+async def get_pancake_price_usdt(
+    token: str,
+    db: Optional[Session] = None
+) -> Optional[float]:
+    """
+    Получить цену с PancakeSwap через прокси.
+    
+    Args:
+        token: Адрес токена на BSC
+        db: Сессия БД для получения прокси
+    
+    Returns:
+        Цена в USDT или None при ошибке
+    """
+    url = "https://api.dexscreener.com/latest/dex/tokens/" + token
+    
+    try:
+        # Получаем прокси из БД
+        proxy_url = None
+        if db:
+            proxy_manager = ProxyManager(db )
+            proxy_url = proxy_manager.get_random_proxy()
+            if proxy_url:
+                proxy_manager.log_proxy_usage(proxy_url)
+        
+        # Создаем async клиент с прокси
+        async with httpx.AsyncClient(proxies=proxy_url, timeout=10 ) as client:
+            r = await client.get(url)
+            
+            if r.status_code != 200:
+                log(f"Pancake HTTP {r.status_code}: {r.text[:200]}")
+                return None
+            
+            j = r.json()
+            pairs = j.get("pairs", [])
+            if not pairs:
+                return None
+            
+            return float(pairs[0].get("priceUsd", 0))
+    
+    except Exception as e:
+        log(f"Pancake error: {e}")
+        return None
