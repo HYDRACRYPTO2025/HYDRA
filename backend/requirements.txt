@@ -1,6 +1,6 @@
 fastapi
-uvicorn[standard]
-sqlalchemy
-psycopg2-binary
-cloudscraper
+uvicorn
 httpx
+cloudscraper
+pydantic
+python-dotenv
