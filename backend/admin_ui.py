@@ -427,7 +427,7 @@ async def create_token_form(
         return RedirectResponse(url="/admin?error=Error creating token", status_code=303)
 
 
-@router.get("/api/admin/tokens")
+@router.get("/api/tokens")
 async def get_tokens_api(db: Session = Depends(get_db)):
     """
     API для получения списка токенов (для JavaScript).
@@ -446,7 +446,7 @@ async def get_tokens_api(db: Session = Depends(get_db)):
     }
 
 
-@router.get("/api/admin/proxies")
+@router.get("/api/proxies")
 async def get_proxies_api(db: Session = Depends(get_db)):
     """
     API для получения списка прокси (для JavaScript).
@@ -465,7 +465,7 @@ async def get_proxies_api(db: Session = Depends(get_db)):
     }
 
 
-@router.delete("/api/admin/token/{token_id}")
+@router.delete("/api/token/{token_id}")
 async def delete_token_api(token_id: int, db: Session = Depends(get_db)):
     """
     API для удаления токена (для JavaScript).
@@ -481,7 +481,7 @@ async def delete_token_api(token_id: int, db: Session = Depends(get_db)):
     return {"message": "Token deleted"}
 
 
-@router.delete("/api/admin/proxy/{proxy_id}")
+@router.delete("/api/proxy/{proxy_id}")
 async def delete_proxy_api(proxy_id: int, db: Session = Depends(get_db)):
     """
     API для удаления прокси (для JavaScript).
