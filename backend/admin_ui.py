@@ -355,7 +355,6 @@ HTML_TEMPLATE = """
 
 
 @router.get("/", response_class=HTMLResponse)
-@router.get("", response_class=HTMLResponse)
 def admin_panel(request: Request):
     """
     Главная страница админ-панели.
