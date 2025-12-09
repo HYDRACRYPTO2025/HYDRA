@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, ForeignKey
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float
 from sqlalchemy.sql import func
 
 from .db import Base
@@ -46,9 +46,9 @@ class Proxy(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     # Формат: socks5://user:pass@ip:port или http://ip:port
-    url = Column(String(256 ), unique=True, nullable=False)
+    url = Column(String(256), unique=True, nullable=False)
     protocol = Column(String(16), nullable=False, default="socks5")  # http, https, socks5
-    is_active = Column(Boolean, default=True )
+    is_active = Column(Boolean, default=True)
     note = Column(String(128), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
