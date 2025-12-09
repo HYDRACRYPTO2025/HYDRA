@@ -1,10 +1,12 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
+from sqlalchemy.orm import Session
 
-from .db import Base, engine
-from .models import Token, Proxy
+from .db import Base, engine, get_db
+from .models import Token, Proxy, AccessToken, AdminUser
 from .logic import fetch_L_M_for_pair, PairConfigLM, log
+from .auth import verify_access_token
 
 # Создаём таблицы в БД при старте (для простоты)
 Base.metadata.create_all(bind=engine)
@@ -14,7 +16,12 @@ app = FastAPI(
     version="0.1.0",
 )
 from .prices_api import router as prices_router
+from .admin_api import router as admin_router
+from .admin_ui import router as admin_ui_router
+
 app.include_router(prices_router, prefix="/api")
+app.include_router(admin_router)
+app.include_router(admin_ui_router)
 
 @app.get("/api/health")
 def health():
@@ -36,9 +43,14 @@ class LMResponse(BaseModel):
 
 
 @app.post("/api/lm", response_model=LMResponse)
-def get_lm(data: LMRequest):
+def get_lm(
+    data: LMRequest,
+    db: Session = Depends(get_db),
+    token = Depends(verify_access_token)
+):
     """
-    Получить L/M для монеты (base/USDT на MEXC + CoinGecko market_cap).
+    Получить L/M для монеты (base/USDT на MEXC + CoinGecko market_cap) через прокси.
+    Требует валидный токен доступа в заголовке Authorization: Bearer {token}
 
     Пример запроса:
     POST /api/lm
@@ -47,7 +59,7 @@ def get_lm(data: LMRequest):
     }
     """
     cfg = PairConfigLM(base=data.base, cg_id=data.cg_id)
-    result = fetch_L_M_for_pair(cfg)
+    result = fetch_L_M_for_pair(cfg, db=db)
     if result is None:
         raise HTTPException(status_code=404, detail="No data for this symbol")
 
