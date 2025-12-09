@@ -8,7 +8,7 @@ from .logic import log
 from .proxy_manager import ProxyManager
 
 
-def get_http_client_with_proxy(proxy_dict: dict ):
+def get_http_client_with_proxy(proxy_dict: dict):
     """
     Создать cloudscraper клиент с прокси.
     proxy_dict должен быть в формате:
@@ -19,7 +19,7 @@ def get_http_client_with_proxy(proxy_dict: dict ):
     """
     http_client = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False}
-     )
+    )
     
     if proxy_dict:
         http_client.proxies = proxy_dict
@@ -27,16 +27,16 @@ def get_http_client_with_proxy(proxy_dict: dict ):
     return http_client
 
 
-async def get_httpx_client_with_proxy(proxy_dict: dict ):
+async def get_httpx_client_with_proxy(proxy_dict: dict):
     """
     Создать httpx AsyncClient с прокси.
     """
     if proxy_dict:
-        # Берем первый прокси из словаря (они одинаковые для http и https )
+        # Берем первый прокси из словаря (они одинаковые для http и https)
         proxy_url = list(proxy_dict.values())[0] if proxy_dict else None
-        return httpx.AsyncClient(proxies=proxy_url, timeout=10 )
+        return httpx.AsyncClient(proxies=proxy_url, timeout=10)
     else:
-        return httpx.AsyncClient(timeout=10 )
+        return httpx.AsyncClient(timeout=10)
 
 
 # --- MEXC ---
@@ -71,13 +71,13 @@ def get_mexc_price(
                 proxy_manager.log_proxy_usage(proxy_url)
         
         # Создаем клиент с прокси
-        http_client = get_http_client_with_proxy(proxy_dict )
+        http_client = get_http_client_with_proxy(proxy_dict)
         
         r = http_client.get(
             "https://api.mexc.com/api/v3/ticker/bookTicker",
             params={"symbol": symbol},
             timeout=10,
-         )
+        )
         
         if r.status_code != 200:
             log(f"MEXC HTTP {r.status_code}: {r.text[:200]}")
@@ -121,16 +121,16 @@ def get_matcha_price_usdt(
         # Получаем прокси из БД
         proxy_dict = {}
         if db:
-            proxy_manager = ProxyManager(db )
+            proxy_manager = ProxyManager(db)
             proxy_url = proxy_manager.get_random_proxy()
             if proxy_url:
                 proxy_dict = proxy_manager.get_proxy_dict(proxy_url)
                 proxy_manager.log_proxy_usage(proxy_url)
         
         # Создаем клиент с прокси
-        http_client = get_http_client_with_proxy(proxy_dict )
+        http_client = get_http_client_with_proxy(proxy_dict)
         
-        r = http_client.get(url, timeout=10 )
+        r = http_client.get(url, timeout=10)
         
         if r.status_code != 200:
             log(f"Matcha HTTP {r.status_code}: {r.text[:200]}")
@@ -164,13 +164,13 @@ async def get_pancake_price_usdt(
         # Получаем прокси из БД
         proxy_url = None
         if db:
-            proxy_manager = ProxyManager(db )
+            proxy_manager = ProxyManager(db)
             proxy_url = proxy_manager.get_random_proxy()
             if proxy_url:
                 proxy_manager.log_proxy_usage(proxy_url)
         
         # Создаем async клиент с прокси
-        async with httpx.AsyncClient(proxies=proxy_url, timeout=10 ) as client:
+        async with httpx.AsyncClient(proxies=proxy_url, timeout=10) as client:
             r = await client.get(url)
             
             if r.status_code != 200:
