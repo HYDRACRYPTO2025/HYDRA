@@ -1,16 +1,16 @@
-# FastAPI и веб-сервер (старые версии без Rust зависимостей)
-fastapi==0.68.0
-uvicorn==0.15.0
+# FastAPI и веб-сервер
+fastapi==0.104.1
+uvicorn==0.24.0
 
-# Pydantic v1 (без Rust)
-pydantic==1.8.2
+# Pydantic v2 (совместима с Python 3.13)
+pydantic==2.5.3
 
 # База данных
-sqlalchemy==1.4.46
+sqlalchemy==2.0.23
 psycopg2-binary==2.9.9
 
 # HTTP клиент
-httpx==0.23.3
+httpx==0.25.2
 requests==2.31.0
 
 # Прокси и сетевые утилиты
