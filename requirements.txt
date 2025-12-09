@@ -5,3 +5,4 @@ cloudscraper
 pydantic
 python-dotenv
 sqlalchemy
+psycopg2-binary
