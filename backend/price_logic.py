@@ -20,7 +20,7 @@ def get_http_client_with_proxy(proxy_dict: dict):
         return httpx.AsyncClient(timeout=10)
 
 
-# ... MEXC UTILS - ДОБАВЛЕНО ---
+# ... MEXC UTILS ---
 def normalize_mexc_symbol(token: str) -> str:
     """
     Приводим тикер к формату AAA_BBB (например MEMERUSH_USDT).
@@ -79,10 +79,12 @@ def get_mexc_price(
     try:
         # Получаем прокси из БД
         proxy_dict = {}
+        proxy_url = None
         if db:
             proxy_manager = ProxyManager(db)
-            proxy_manager.log_proxy_usage()
             proxy_url = proxy_manager.get_random_proxy()
+            # ИСПРАВЛЕНО: Передаём proxy_url в log_proxy_usage
+            proxy_manager.log_proxy_usage(proxy_url)
             if proxy_url:
                 proxy_dict = {
                     "http://": proxy_url,
@@ -136,10 +138,12 @@ def get_matcha_price_usdt(
     try:
         # Получаем прокси из БД
         proxy_dict = {}
+        proxy_url = None
         if db:
             proxy_manager = ProxyManager(db)
-            proxy_manager.log_proxy_usage()
             proxy_url = proxy_manager.get_random_proxy()
+            # ИСПРАВЛЕНО: Передаём proxy_url в log_proxy_usage
+            proxy_manager.log_proxy_usage(proxy_url)
             if proxy_url:
                 proxy_dict = {
                     "http://": proxy_url,
@@ -188,10 +192,12 @@ def get_pancake_price_usdt(
     try:
         # Получаем прокси из БД
         proxy_dict = {}
+        proxy_url = None
         if db:
             proxy_manager = ProxyManager(db)
-            proxy_manager.log_proxy_usage()
             proxy_url = proxy_manager.get_random_proxy()
+            # ИСПРАВЛЕНО: Передаём proxy_url в log_proxy_usage
+            proxy_manager.log_proxy_usage(proxy_url)
             if proxy_url:
                 proxy_dict = {
                     "http://": proxy_url,
