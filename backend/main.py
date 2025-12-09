@@ -13,7 +13,8 @@ app = FastAPI(
     title="HYDRA backend",
     version="0.1.0",
 )
-
+from .prices_api import router as prices_router
+app.include_router(prices_router, prefix="/api")
 
 @app.get("/api/health")
 def health():
