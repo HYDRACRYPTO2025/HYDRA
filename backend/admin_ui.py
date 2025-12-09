@@ -355,10 +355,143 @@ HTML_TEMPLATE = """
 
 
 @router.get("/", response_class=HTMLResponse)
-@router.get("", response_class=HTMLResponse)
 def admin_panel(request: Request):
     """
     Главная страница админ-панели.
     Возвращает HTML интерфейс.
     """
     return HTML_TEMPLATE
+
+
+@router.post("/add-proxy")
+async def add_proxy_form(
+    proxy_url: str = Form(...),
+    proxy_type: str = Form("http"),
+    db: Session = Depends(get_db)
+):
+    """
+    Обработчик формы для добавления прокси.
+    """
+    try:
+        # Проверяем, что прокси с таким URL еще не существует
+        existing = db.query(Proxy).filter(Proxy.url == proxy_url).first()
+        if existing:
+            return RedirectResponse(url="/admin?error=Proxy already exists", status_code=303)
+        
+        new_proxy = Proxy(
+            url=proxy_url,
+            protocol=proxy_type,
+            is_active=True
+        )
+        
+        db.add(new_proxy)
+        db.commit()
+        
+        log(f"Created new proxy: {proxy_url}")
+        return RedirectResponse(url="/admin?success=Proxy added", status_code=303)
+    
+    except Exception as e:
+        log(f"Error adding proxy: {e}")
+        return RedirectResponse(url="/admin?error=Error adding proxy", status_code=303)
+
+
+@router.post("/create-token")
+async def create_token_form(
+    token_name: str = Form(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Обработчик формы для создания токена доступа.
+    """
+    try:
+        # Генерируем уникальный токен
+        token_value = generate_token()
+        
+        new_token = AccessToken(
+            token=token_value,
+            name=token_name,
+            is_active=True
+        )
+        
+        db.add(new_token)
+        db.commit()
+        db.refresh(new_token)
+        
+        log(f"Created new access token: {token_name}")
+        
+        # Перенаправляем обратно с токеном в URL (для отображения)
+        return RedirectResponse(url=f"/admin?token={token_value}&name={token_name}", status_code=303)
+    
+    except Exception as e:
+        log(f"Error creating token: {e}")
+        return RedirectResponse(url="/admin?error=Error creating token", status_code=303)
+
+
+@router.get("/api/admin/tokens")
+async def get_tokens_api(db: Session = Depends(get_db)):
+    """
+    API для получения списка токенов (для JavaScript).
+    """
+    tokens = db.query(AccessToken).filter(AccessToken.is_active == True).all()
+    return {
+        "tokens": [
+            {
+                "id": t.id,
+                "name": t.name,
+                "token": t.token,
+                "created_at": t.created_at.isoformat() if t.created_at else None
+            }
+            for t in tokens
+        ]
+    }
+
+
+@router.get("/api/admin/proxies")
+async def get_proxies_api(db: Session = Depends(get_db)):
+    """
+    API для получения списка прокси (для JavaScript).
+    """
+    proxies = db.query(Proxy).filter(Proxy.is_active == True).all()
+    return {
+        "proxies": [
+            {
+                "id": p.id,
+                "url": p.url,
+                "proxy_type": p.protocol,
+                "created_at": p.created_at.isoformat() if p.created_at else None
+            }
+            for p in proxies
+        ]
+    }
+
+
+@router.delete("/api/admin/token/{token_id}")
+async def delete_token_api(token_id: int, db: Session = Depends(get_db)):
+    """
+    API для удаления токена (для JavaScript).
+    """
+    token = db.query(AccessToken).filter(AccessToken.id == token_id).first()
+    if not token:
+        raise HTTPException(status_code=404, detail="Token not found")
+    
+    db.delete(token)
+    db.commit()
+    
+    log(f"Deleted access token {token_id}")
+    return {"message": "Token deleted"}
+
+
+@router.delete("/api/admin/proxy/{proxy_id}")
+async def delete_proxy_api(proxy_id: int, db: Session = Depends(get_db)):
+    """
+    API для удаления прокси (для JavaScript).
+    """
+    proxy = db.query(Proxy).filter(Proxy.id == proxy_id).first()
+    if not proxy:
+        raise HTTPException(status_code=404, detail="Proxy not found")
+    
+    db.delete(proxy)
+    db.commit()
+    
+    log(f"Deleted proxy {proxy_id}")
+    return {"message": "Proxy deleted"}
