@@ -199,7 +199,7 @@ HTML_TEMPLATE = """
         
         <div class="card">
             <h2>📝 Создать Access Token</h2>
-            <form method="post" action="/api/admin/create-token">
+            <form method="post" action="/admin/create-token">
                 <div class="form-group">
                     <label for="token_name">Имя токена:</label>
                     <input type="text" id="token_name" name="token_name" placeholder="Например: Desktop App" required>
@@ -220,7 +220,7 @@ HTML_TEMPLATE = """
         
         <div class="card">
             <h2>🌐 Добавить прокси</h2>
-            <form method="post" action="/api/admin/add-proxy">
+            <form method="post" action="/admin/add-proxy">
                 <div class="form-group">
                     <label for="proxy_url">URL прокси:</label>
                     <input type="text" id="proxy_url" name="proxy_url" placeholder="http://proxy.example.com:8080" required>
@@ -256,7 +256,7 @@ HTML_TEMPLATE = """
         // Загрузить список токенов
         async function loadTokens() {
             try {
-                const response = await fetch('/api/admin/tokens');
+                const response = await fetch('/admin/api/tokens');
                 const data = await response.json();
                 const tokensList = document.getElementById('tokens-list');
                 
@@ -288,7 +288,7 @@ HTML_TEMPLATE = """
         // Загрузить список прокси
         async function loadProxies() {
             try {
-                const response = await fetch('/api/admin/proxies');
+                const response = await fetch('/admin/api/proxies');
                 const data = await response.json();
                 const proxiesList = document.getElementById('proxies-list');
                 
@@ -320,7 +320,7 @@ HTML_TEMPLATE = """
         async function deleteToken(tokenId) {
             if (confirm('Вы уверены?')) {
                 try {
-                    await fetch(`/api/admin/token/${tokenId}`, { method: 'DELETE' });
+                    await fetch(`/admin/api/token/${tokenId}`, { method: 'DELETE' });
                     loadTokens();
                 } catch (error) {
                     console.error('Error deleting token:', error);
@@ -331,7 +331,7 @@ HTML_TEMPLATE = """
         async function deleteProxy(proxyId) {
             if (confirm('Вы уверены?')) {
                 try {
-                    await fetch(`/api/admin/proxy/${proxyId}`, { method: 'DELETE' });
+                    await fetch(`/admin/api/proxy/${proxyId}`, { method: 'DELETE' });
                     loadProxies();
                 } catch (error) {
                     console.error('Error deleting proxy:', error);
