@@ -27,7 +27,7 @@ class ProxyManager:
         - socks5://user:pass@ip:port
         - http://user:pass@ip:port
         """
-        proxies = self.get_active_proxies( )
+        proxies = self.get_active_proxies()
         if not proxies:
             return None
         
@@ -46,7 +46,7 @@ class ProxyManager:
         }
         """
         if proxy_url is None:
-            proxy_url = self.get_random_proxy( )
+            proxy_url = self.get_random_proxy()
         
         if not proxy_url:
             return {}
@@ -56,7 +56,7 @@ class ProxyManager:
             "https://": proxy_url,
         }
 
-    def get_proxy_safe_host(self, proxy_url: str ) -> str:
+    def get_proxy_safe_host(self, proxy_url: str) -> str:
         """
         Убрать логин/пароль из URL прокси для логирования.
         Пример:
